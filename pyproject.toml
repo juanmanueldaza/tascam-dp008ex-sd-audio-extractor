@@ -1,6 +1,6 @@
 [project]
 name = "tascam-dp008ex-sd-audio-extractor"
-version = "0.1.0"
+version = "0.2.0"
 description = "Extract master and stem WAVs from Tascam DP-008EX SD card images (reverse-engineered read-only tool)"
 readme = "README.md"
 license = { text = "MIT" }

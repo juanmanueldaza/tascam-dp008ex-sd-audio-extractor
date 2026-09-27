@@ -34,14 +34,58 @@ pip install .
 ## Use
 
 ```bash
-tascam-dp008ex-sd-audio-extractor list ~/dp008ex_card2.img        # MBR/MTR/BFS/songs/masters
-tascam-dp008ex-sd-audio-extractor extract-all <img> --out-dir out  # master chains -> mono WAVs
-tascam-dp008ex-sd-audio-extractor stems <img> --out-dir stems      # stem timelines -> WAVs
-tascam-dp008ex-sd-audio-extractor verify <img>                     # cross-check model (exit 0 = PASS)
-tascam-dp008ex-sd-audio-extractor carve <img> --stride 64          # survey pool for PCM clusters
+tascam-dp008ex-sd-audio-extractor devices                    # what cards are attached?
+tascam-dp008ex-sd-audio-extractor image /dev/sdb -o card.img # card -> image, verified
+tascam-dp008ex-sd-audio-extractor list card.img              # MBR/MTR/BFS/songs/masters
+tascam-dp008ex-sd-audio-extractor extract-all card.img       # master chains -> mono WAVs
+tascam-dp008ex-sd-audio-extractor stems card.img             # stem timelines -> WAVs
+tascam-dp008ex-sd-audio-extractor verify card.img            # cross-check model (exit 0 = PASS)
 ```
 
-Also runnable as `python3 -m tascam_dp008ex_sd_audio_extractor ...`.
+Also runnable as `python3 -m tascam_dp008ex_sd_audio_extractor ...`. Every read
+command (`list`, `carve`, `extract-all`, `stems`, `verify`) accepts **either** a
+whole block device **or** an image file.
+
+## Working with SD cards directly
+
+The DP-008EX stores songs in an **undeclared region after partition 0** — the
+multitrack audio is not on any filesystem. That is why a mounted card looks
+empty, and why copying files off it (or the recorder's own USB export) recovers
+nothing. You have to read the **whole device**.
+
+```bash
+# 1. what did we plug in? (judge by CONTENTS, not by REMOVABLE)
+tascam-dp008ex-sd-audio-extractor devices
+#    /dev/mmcblk0    3.7 GiB  no  6 master chain(s), 16 stem chain(s)   <- your card
+
+# 2. image it (read-only source; verified by re-reading the image)
+sudo tascam-dp008ex-sd-audio-extractor image /dev/mmcblk0 -o ~/card.img
+
+# 3. work on the image at leisure
+tascam-dp008ex-sd-audio-extractor verify ~/card.img
+tascam-dp008ex-sd-audio-extractor extract-all ~/card.img --out-dir ~/out
+```
+
+Or skip the image and read the card directly (needs privileges for the device):
+
+```bash
+sudo tascam-dp008ex-sd-audio-extractor stems /dev/mmcblk0 --out-dir ~/out
+```
+
+**Guard rails** — the two easy mistakes are handled for you:
+
+- **Partition nodes are refused.** `/dev/sdb1`, `/dev/disk2s1` and `D:\` exit
+  with an error naming the device you should use instead, because imaging one
+  produces an empty-looking card and you would never know songs were missing.
+- **`image` will not overwrite the card it is reading**, will not write to a
+  device node, and will not clobber an existing file without `--overwrite`. An
+  interrupted image continues with `--resume`.
+- Reading raw devices needs root or the `disk` group. The tool never writes to a
+  card, and the card never needs to be mounted.
+
+On macOS use the whole disk (`/dev/rdisk2`, faster than `/dev/disk2`); on
+Windows use `\\.\PhysicalDriveN`. Both are recognised, and `devices` reports
+what it can see — including an honest "unreadable (needs root or the disk group)".
 
 `list` prints: MBR + MTR bounds, header checks (magic, self-ptr, mtr-start, bitmap),
 BFS ROOT hits, song slots (`Sxxx/SONGxxx`, 250 slots on empty card), alloc-table

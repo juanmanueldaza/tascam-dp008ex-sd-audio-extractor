@@ -1,4 +1,11 @@
-"""CLI: tascam-dp008ex-sd-audio-extractor list|carve|extract-all|stems|verify <image>."""
+"""CLI: tascam-dp008ex-sd-audio-extractor.
+
+Commands: devices | image | list | carve | extract-all | stems | verify
+
+Every read command accepts either a whole block device (/dev/sdb, /dev/rdisk2)
+or an image file; partition nodes are refused because the DP-008EX keeps the
+multitrack audio outside every partition.
+"""
 
 import argparse
 import collections
@@ -6,8 +13,17 @@ import hashlib
 import os
 import struct
 import sys
+import time
 
 from .carve import CLUSTER, POOL_OFF, sweep
+from .devices import (
+    PartitionNodeError,
+    can_read,
+    check_read_target,
+    device_size,
+    is_removable,
+    list_device_nodes,
+)
 from .extract import (
     HALF,
     SECTOR_BYTES,
@@ -17,6 +33,7 @@ from .extract import (
     render_chain,
 )
 from .header import parse_header
+from .imaging import image_device
 from .mbr import mtr_bounds, parse_mbr
 from .scan import find_bfs_roots, scan_alloc_table, scan_song_slots
 from .stems import FRAG, FRAG_SAMPLES, RAW_SECTOR, STEM_FLAGS, render_stem
@@ -25,6 +42,123 @@ from .wavio import RATE, pcm_stats, write_wav
 # song assignment by timeline top (samples): short<=0x9D0000, A<=0x6F00000, else B
 SONG_SHORT_TOP = 0x9D0000
 SONG_A_TOP = 0x6F00000
+READ_COMMANDS = ("list", "carve", "extract-all", "stems", "verify")
+
+
+def human(n):
+    if n is None:
+        return "unknown size"
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024
+    return f"{n:.1f} TiB"
+
+
+def banner(path):
+    """One line telling the user what they are actually reading."""
+    kind = check_read_target(path)  # raises on partition nodes
+    if kind == "block device":
+        size = device_size(path)
+        print(
+            f"input: block device {path} ({human(size)}) - whole device, not a partition"
+        )
+    else:
+        print(f"input: image file {path}")
+    return kind
+
+
+def cmd_devices(probe=True):
+    """List candidate whole devices and, when readable, what audio they hold."""
+    nodes = list_device_nodes()
+    if not nodes:
+        print(
+            "no candidate block devices found (looked for /dev/sd*, /dev/nvme*, "
+            "/dev/mmcblk*, /dev/disk*)"
+        )
+        print("on macOS use the whole disk (/dev/rdiskN), not /dev/diskNs1")
+        return
+    print(f"{'DEVICE':22} {'SIZE':>11}  REMOVABLE  CONTENTS")
+    for node in nodes:
+        size = device_size(node)
+        removable = is_removable(node)
+        rem = {True: "yes", False: "no", None: "?"}[removable]
+        contents = "-"
+        if not can_read(node):
+            contents = "unreadable (needs root or the disk group)"
+        elif probe:
+            try:
+                with open(node, "rb") as f:
+                    mbr = parse_mbr(f)
+                    base, end = mtr_bounds(mbr)
+                    if base >= end:
+                        contents = "no MTR region"
+                    else:
+                        masters = collect_chains(read_alloc(f, base))
+                        stems = collect_chains(
+                            read_alloc(f, base, flags=STEM_FLAGS), STEM_FLAGS
+                        )
+                        contents = f"{len(masters)} master chain(s), {len(stems)} stem chain(s)"
+            except (OSError, ValueError) as e:
+                contents = f"unreadable ({type(e).__name__})"
+        print(f"{node:22} {human(size):>11}  {rem:9}  {contents}")
+    if probe:
+        print(
+            "\nA DP-008EX card shows master and stem chains. Other media usually show none."
+        )
+    print(
+        "Partition nodes (/dev/sdb1, /dev/disk2s1) are never the right input: the "
+        "songs live outside every partition."
+    )
+    print(
+        "Note: 'removable' is the slot flag; built-in card readers often report 'no' "
+        "even with a card inserted. Judge by CONTENTS, not by that column."
+    )
+
+
+def cmd_image(src, dst, chunk_mb=8, verify=True, resume=False, overwrite=False):
+    """Copy a whole device to an image file and verify it."""
+    started = [time.monotonic()]
+    last = [0.0]
+    tty = sys.stdout.isatty()
+
+    def progress(done, total):
+        now = time.monotonic()
+        final = total is not None and done >= total
+        if not final and (now - last[0] < 1.0 or (total and done / total < 0.25)):
+            return
+        last[0] = now
+        pct = f"{done / total * 100:5.1f}%" if total else "  ?  "
+        rate = done / max(1e-9, now - started[0]) / 1024 / 1024
+        # Redraw in place on a terminal; plain lines when piped to a file.
+        print(f"  {pct}  {human(done)}  {rate:.0f} MiB/s", end="\n" if not tty else "")
+
+    started[0] = time.monotonic()
+    print(f"imaging {src} -> {dst} (read-only source)", flush=True)
+    summary = image_device(
+        src,
+        dst,
+        chunk=chunk_mb * 1024 * 1024,
+        verify=verify,
+        resume=resume,
+        overwrite=overwrite,
+        on_progress=progress,
+    )
+    print(
+        f"wrote {human(summary['bytes'])} in {summary['seconds']:.1f}s\n"
+        f"sha256: {summary['sha256']}"
+    )
+    if verify:
+        ok = summary["verified"]
+        print(
+            f"verify: {'PASS' if ok else 'FAIL'} "
+            f"(re-read {human(summary['verify_bytes'])} of the image)"
+        )
+        if not ok:
+            print(f"  image digest differs: {summary.get('verify_digest')}")
+            return 1
+    print("next: run `verify` on the image, then `extract-all` / `stems`")
+    return 0
 
 
 def song_name(top):
@@ -352,8 +486,39 @@ def main(argv=None):
         "verify", help="cross-check render model against the image (no WAV output)"
     )
     pv.add_argument("image")
+    pd = sub.add_parser(
+        "devices", help="list candidate SD/USB devices and what audio they hold"
+    )
+    pd.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="skip reading each device's alloc table",
+    )
+    pi = sub.add_parser(
+        "image", help="copy a whole device to an image file, then verify it"
+    )
+    pi.add_argument("device", help="whole device, e.g. /dev/sdb (never /dev/sdb1)")
+    pi.add_argument("-o", "--out", required=True, help="output .img path")
+    pi.add_argument("--chunk-mb", type=int, default=8)
+    pi.add_argument("--no-verify", action="store_true", help="skip the re-read check")
+    pi.add_argument("--resume", action="store_true", help="continue a partial image")
+    pi.add_argument("--overwrite", action="store_true", help="replace an existing file")
     a = ap.parse_args(argv)
     try:
+        if a.cmd == "devices":
+            cmd_devices(probe=not a.no_probe)
+            return 0
+        if a.cmd == "image":
+            return cmd_image(
+                a.device,
+                a.out,
+                chunk_mb=a.chunk_mb,
+                verify=not a.no_verify,
+                resume=a.resume,
+                overwrite=a.overwrite,
+            )
+        if a.cmd in READ_COMMANDS:
+            banner(a.image)  # refuses partition nodes
         if a.cmd == "list":
             cmd_list(a.image)
         elif a.cmd == "carve":
@@ -370,7 +535,7 @@ def main(argv=None):
             cmd_stems(a.image, out_dir=a.out_dir)
         elif a.cmd == "verify":
             return cmd_verify(a.image)
-    except (OSError, ValueError, MemoryError) as e:
+    except (OSError, ValueError, MemoryError, PartitionNodeError) as e:
         print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
     return 0
