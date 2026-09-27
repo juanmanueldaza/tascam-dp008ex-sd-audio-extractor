@@ -44,7 +44,10 @@ def _same_target(src, dst):
         s, d = os.stat(src), os.stat(dst)
     except OSError:
         return False
-    if s.st_rdev and s.st_rdev == d.st_rdev:
+    # st_rdev only exists on POSIX; on Windows device identity is not exposed.
+    s_rdev = getattr(s, "st_rdev", None)
+    d_rdev = getattr(d, "st_rdev", None)
+    if s_rdev and s_rdev == d_rdev:
         return True
     return s.st_dev == d.st_dev and s.st_ino == d.st_ino
 
