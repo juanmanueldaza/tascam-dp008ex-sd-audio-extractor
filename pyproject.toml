@@ -1,0 +1,64 @@
+[project]
+name = "tascam-dp008ex-sd-audio-extractor"
+version = "0.1.0"
+description = "Extract master and stem WAVs from Tascam DP-008EX SD card images (reverse-engineered read-only tool)"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Juan Manuel Daza", email = "juanmanueldaza@gmail.com" }]
+requires-python = ">=3.10"
+keywords = [
+    "tascam",
+    "dp-008ex",
+    "portastudio",
+    "multitrack",
+    "audio",
+    "recovery",
+    "wav",
+    "sd-card",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.scripts]
+tascam-dp008ex-sd-audio-extractor = "tascam_dp008ex_sd_audio_extractor.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=9.0", "ruff>=0.9", "pyright>=1.1.408"]
+
+[project.urls]
+Homepage = "https://github.com/juanmanueldaza/tascam-dp008ex-sd-audio-extractor"
+Repository = "https://github.com/juanmanueldaza/tascam-dp008ex-sd-audio-extractor"
+Issues = "https://github.com/juanmanueldaza/tascam-dp008ex-sd-audio-extractor/issues"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tascam_dp008ex_sd_audio_extractor"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP"]
+# Long f-strings in the CLI cannot be wrapped cleanly; ruff format owns width.
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
