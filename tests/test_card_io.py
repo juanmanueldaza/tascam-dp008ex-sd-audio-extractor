@@ -729,3 +729,23 @@ def test_aligned_reader_close_is_idempotent(tmp_path):
         r.read(1)
     with pytest.raises(ValueError, match="closed file"):
         r.seek(0)
+
+
+def test_aligned_reader_accepts_an_explicit_size(tmp_path):
+    """Windows cannot SEEK_END a raw disk handle, so the size must be injectable."""
+    p = tmp_path / "img.bin"
+    p.write_bytes(b"m" * 2048)
+    with AlignedReader(p, size=2048) as r:
+        assert r.seek(0, os.SEEK_END) == 2048
+        r.seek(1024)
+        assert r.read() == b"m" * 1024
+
+
+def test_aligned_reader_reports_unknown_size_instead_of_lying(tmp_path):
+    p = tmp_path / "img.bin"
+    p.write_bytes(b"n" * 600)
+    with AlignedReader(p, size=0) as r:
+        with pytest.raises(ValueError, match="size is unknown"):
+            r.seek(0, os.SEEK_END)
+        with pytest.raises(ValueError, match="size is unknown"):
+            r.read()

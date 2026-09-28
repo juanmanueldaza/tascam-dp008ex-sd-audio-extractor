@@ -234,12 +234,20 @@ class AlignedReader:
     read, tell, close, and the context-manager protocol.
     """
 
-    def __init__(self, path):
+    def __init__(self, path, size=None):
         self._fd: int = os.open(str(path), os.O_RDONLY | getattr(os, "O_BINARY", 0))
         self._closed = False
         try:
             self._pos = 0
-            self._size = os.lseek(self._fd, 0, os.SEEK_END)
+            if size is None:
+                try:
+                    size = os.lseek(self._fd, 0, os.SEEK_END)
+                except OSError:
+                    # Windows rejects SEEK_END on a raw disk handle (Errno 22).
+                    # device_size() asks the OS instead, via DeviceIoControl on
+                    # Windows and sysfs or a plain seek elsewhere.
+                    size = device_size(path)
+            self._size: int | None = int(size) if size else None
         except OSError:
             os.close(self._fd)
             self._closed = True
@@ -262,6 +270,8 @@ class AlignedReader:
         elif whence == os.SEEK_CUR:
             self._pos += offset
         elif whence == os.SEEK_END:
+            if self._size is None:
+                raise ValueError("device size is unknown, cannot seek from the end")
             self._pos = self._size + offset
         else:
             raise ValueError(f"invalid whence {whence!r}")
@@ -271,8 +281,10 @@ class AlignedReader:
         if self._closed:
             raise ValueError("I/O operation on closed file")
         if size is None or size < 0:
+            if self._size is None:
+                raise ValueError("device size is unknown, cannot read to the end")
             size = max(0, self._size - self._pos)
-        if size == 0 or self._pos >= self._size:
+        if size == 0 or (self._size is not None and self._pos >= self._size):
             return b""
         sector = 512
         start = self._pos
@@ -282,7 +294,10 @@ class AlignedReader:
         os.lseek(self._fd, start - skip, os.SEEK_SET)
         buf = os.read(self._fd, want)
         if len(buf) <= skip:
-            self._pos = self._size
+            if self._size is not None:
+                self._pos = self._size
+            else:
+                self._pos += max(0, size)
             return b""
         out = buf[skip : skip + size]
         # Advance by what the caller was given, not by the sector-rounded
