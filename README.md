@@ -34,14 +34,71 @@ pip install .
 ## Use
 
 ```bash
-tascam-dp008ex-sd-audio-extractor list ~/dp008ex_card2.img        # MBR/MTR/BFS/songs/masters
-tascam-dp008ex-sd-audio-extractor extract-all <img> --out-dir out  # master chains -> mono WAVs
-tascam-dp008ex-sd-audio-extractor stems <img> --out-dir stems      # stem timelines -> WAVs
-tascam-dp008ex-sd-audio-extractor verify <img>                     # cross-check model (exit 0 = PASS)
-tascam-dp008ex-sd-audio-extractor carve <img> --stride 64          # survey pool for PCM clusters
+tascam-dp008ex-sd-audio-extractor devices                    # what cards are attached?
+tascam-dp008ex-sd-audio-extractor image /dev/sdb -o card.img # card -> image, verified
+tascam-dp008ex-sd-audio-extractor list card.img              # MBR/MTR/BFS/songs/masters
+tascam-dp008ex-sd-audio-extractor extract-all card.img       # master chains -> mono WAVs
+tascam-dp008ex-sd-audio-extractor stems card.img             # stem timelines -> WAVs
+tascam-dp008ex-sd-audio-extractor verify card.img            # cross-check model (exit 0 = PASS)
 ```
 
-Also runnable as `python3 -m tascam_dp008ex_sd_audio_extractor ...`.
+Also runnable as `python3 -m tascam_dp008ex_sd_audio_extractor ...`. Every read
+command (`list`, `carve`, `extract-all`, `stems`, `verify`) accepts **either** a
+whole block device **or** an image file.
+
+## Working with SD cards directly
+
+The DP-008EX stores songs in an **undeclared region after partition 0** — the
+multitrack audio is not on any filesystem. That is why a mounted card looks
+empty, and why copying files off it (or the recorder's own USB export) recovers
+nothing. You have to read the **whole device**.
+
+```bash
+# 1. what did we plug in? (judge by CONTENTS, not by REMOVABLE)
+tascam-dp008ex-sd-audio-extractor devices
+#    /dev/mmcblk0    3.7 GiB  no  6 master chain(s), 16 stem chain(s)   <- your card
+
+# 2. image it (read-only source; verified by re-reading the image)
+sudo tascam-dp008ex-sd-audio-extractor image /dev/mmcblk0 -o ~/card.img
+
+# 3. work on the image at leisure
+tascam-dp008ex-sd-audio-extractor verify ~/card.img
+tascam-dp008ex-sd-audio-extractor extract-all ~/card.img --out-dir ~/out
+```
+
+Or skip the image and read the card directly (needs privileges for the device):
+
+```bash
+sudo tascam-dp008ex-sd-audio-extractor stems /dev/mmcblk0 --out-dir ~/out
+```
+
+**Guard rails** — the two easy mistakes are handled for you:
+
+- **Partition nodes are refused.** `/dev/sdb1`, `/dev/disk2s1` and `D:\` exit
+  with an error naming the device you should use instead, because imaging one
+  produces an empty-looking card and you would never know songs were missing.
+- **A mounted card is called out.** If the desktop has already mounted the card,
+  `devices` lists the mountpoint and says where the songs really are:
+
+  ```text
+  MOUNTED VOLUMES on candidate devices
+    /run/media/you/DP-008EX  (vfat, /dev/mmcblk0p1)
+      labelled like a DP-008EX: the songs are on /dev/mmcblk0, not in this mountpoint
+  ```
+
+  Do not copy WAVs out of that mountpoint, and do not point the tool at it: the
+  `WAVE/` and `BACKUP/` folders there are exports and backups, not the songs.
+- **`image` will not overwrite the card it is reading**, will not write to a
+  device node, and will not clobber an existing file without `--overwrite`. An
+  interrupted image continues with `--resume`.
+- Reading raw devices needs root or the `disk` group. The tool never writes to a
+  card, and the card never needs to be mounted.
+
+On macOS use the whole disk (`/dev/rdisk2`, faster than `/dev/disk2`); on
+Windows use `\\.\PhysicalDriveN`. Both are recognised. `devices` reports what it
+can see — including an honest "unreadable (needs root or the disk group)" — and
+the table above is explicit about which platform has been tested against real
+hardware.
 
 `list` prints: MBR + MTR bounds, header checks (magic, self-ptr, mtr-start, bitmap),
 BFS ROOT hits, song slots (`Sxxx/SONGxxx`, 250 slots on empty card), alloc-table
@@ -71,6 +128,42 @@ flag histogram + master/inode/extent counts.
 - Song slots @MTR+~35.7MB (`0x1000D9428`), stride 0x24, 250 entries
 - Alloc @MTR+0x288000 (1MiB, 16384×64B): pool `0x80040003/0x80104900` ×256,
   no `0x80030000` masters / `0x9001000x` inodes on empty card
+
+## Platform support — and what is actually verified
+
+Being straight about the evidence, because "works on Linux, macOS and Windows" is
+a claim that deserves receipts:
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Read a real card or image | **verified on hardware** | *not yet executed* | verified in CI |
+| `devices` discovery | sysfs (size/removable) | `/dev/disk*` + `diskutil` | `\\.\PhysicalDriveN` via `CreateFileW`/`DeviceIoControl` |
+| Mounted-card warning | `/proc/self/mounts` | `mount` output | removable drive letters |
+| Tested on | a 4GB Tascam DP-008EX card | nothing yet | CI runner's `\\.\PhysicalDrive0` |
+| Python versions exercised | 3.10, 3.12, 3.14 | 3.12 | 3.10, 3.12, 3.14 |
+
+- **Linux** is the only platform with real hardware behind it. Everything below was
+  read from an actual card (`/dev/mmcblk0`), and `stems /dev/mmcblk0` produces
+  output byte-identical to rendering the same card from an image.
+- **Windows** runs for real in CI, where the runner's own `\\.\PhysicalDrive0` is
+  opened and queried. That is how two bugs in the ctypes backend were caught:
+  the `STORAGE_PROPERTY_QUERY` buffer was undersized, so Windows rejected the
+  query and the removable flag silently came back unknown. A removable drive
+  letter is reported but deliberately *not* mapped to a physical drive — that
+  needs a device-stack walk, and guessing would be worse than saying so. Use
+  `\\.\PhysicalDrive0`, not `E:\`; `E:\` is a partition and is refused. Reading a
+  physical drive needs an Administrator shell.
+- **macOS is the weakest link, and this table says so.** The code paths are
+  implemented (`diskutil info -plist` for size and removable state, `mount` for
+  volumes, `/dev/rdisk*` for the raw node) and type-check against a Darwin target,
+  but the CI leg has been stuck in GitHub's macOS runner queue for hours at a time
+  and has **never executed**; that leg is therefore `continue-on-error`, so a
+  saturated runner pool cannot block releases. Nothing macOS-specific has been
+  run against real hardware either. Use `/dev/rdisk2`, not `/dev/disk2` — the raw
+  node skips the disk-arbiter cache and is several times faster.
+- **Multi-partition cards** are warned about, not silently mis-parsed: only
+  partition 0 is used to locate the MTR, so `verify`/`list` warn if a card declares
+  more than one. A real DP-008EX always has exactly one.
 
 ## Extract (card2, 2026-09-26) — songs recovered
 
@@ -122,6 +215,11 @@ python3 -m pytest tests/
 
 Synthetic-data unit tests (no image needed) for extent parsing, chain walking,
 and both renderers (full-cluster concat, stem boff×2 paste at FRAG=0x8000).
+
+Platform discovery is tested *per platform* rather than mocked: CI runs the
+`devices` command on every runner, so the sysfs, `diskutil` and
+`CreateFileW`/`DeviceIoControl` branches are all executed against real disks
+instead of only being type-checked.
 
 ## License
 
