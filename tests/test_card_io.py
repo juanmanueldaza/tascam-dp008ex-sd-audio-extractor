@@ -13,6 +13,7 @@ import pytest
 
 from tascam_dp008ex_sd_audio_extractor.cli import main
 from tascam_dp008ex_sd_audio_extractor.devices import (
+    AlignedReader,
     PartitionNodeError,
     check_read_target,
     device_size,
@@ -22,6 +23,7 @@ from tascam_dp008ex_sd_audio_extractor.devices import (
     is_whole_device,
     list_device_nodes,
     mounted_volumes,
+    open_device,
     parse_mount_output,
     parse_mounts,
     partition_hint,
@@ -558,3 +560,172 @@ def test_windows_removable_query_uses_a_well_formed_property_query():
     # RemovableMedia is byte 10 of STORAGE_DEVICE_DESCRIPTOR; byte 8 is the bus
     # type, and reading that instead reports every disk as removable.
     assert devices._STOR_DEV_REMOVABLE == 10
+
+
+# --- sector-aligned device reads ---------------------------------------
+# Windows rejects a read that does not begin on a sector boundary when the
+# handle is a raw PhysicalDriveN. The MBR partition table is read 64 bytes at
+# 0x1BE, so a buffered open fails there. AlignedReader is the fix, and it is
+# testable anywhere by pointing it at an ordinary file.
+
+
+def test_aligned_reader_matches_a_plain_file(tmp_path):
+    data = bytes(range(256)) * 40  # 10,240 bytes
+    p = tmp_path / "img.bin"
+    p.write_bytes(data)
+
+    with AlignedReader(p) as r, open(p, "rb") as plain:
+        assert r.read(64) == plain.read(64)
+        assert r.tell() == plain.tell()
+        # the unaligned read that Windows rejects
+        r.seek(0x1BE)
+        assert r.read(64) == data[0x1BE : 0x1BE + 64]
+        r.seek(0)
+        assert r.read() == data
+        r.seek(-10, os.SEEK_END)
+        assert r.read() == data[-10:]
+        r.seek(512, os.SEEK_SET)
+        r.seek(512, os.SEEK_CUR)
+        assert r.tell() == 1024
+
+
+def test_aligned_reader_handles_short_tail_reads(tmp_path):
+    """A read that runs past EOF must return what exists, not raise."""
+    p = tmp_path / "odd.bin"
+    p.write_bytes(b"x" * 700)  # not a multiple of 512
+    with AlignedReader(p) as r:
+        r.seek(512)
+        assert r.read(4096) == b"x" * 188
+        assert r.read(10) == b""
+
+
+def test_aligned_reader_rejects_bad_whence(tmp_path):
+    p = tmp_path / "img.bin"
+    p.write_bytes(b"y" * 1024)
+    with AlignedReader(p) as r, pytest.raises(ValueError):
+        r.seek(0, 99)
+
+
+def test_open_device_uses_a_normal_file_for_images(tmp_path):
+    p = tmp_path / "img.bin"
+    p.write_bytes(b"z" * 1024)
+    with open_device(p) as f:
+        assert not isinstance(f, AlignedReader)
+        assert f.read(4) == b"z" * 4
+
+
+def test_windows_physical_drive_survives_the_unaligned_mbr_read():
+    """The actual bug, on an actual Windows drive, when the runner allows it."""
+    import sys
+
+    from tascam_dp008ex_sd_audio_extractor.mbr import parse_mbr
+
+    if sys.platform != "win32":
+        pytest.skip("needs a Windows physical drive")
+    from tascam_dp008ex_sd_audio_extractor.devices import _win_physical_drives
+
+    nodes = _win_physical_drives()
+    if not nodes:
+        pytest.skip("no openable physical drive on this runner")
+    with open_device(nodes[0]) as f:
+        mbr = parse_mbr(f)
+    assert set(mbr) >= {"entries", "total_sectors", "sig_ok"}
+    assert len(mbr["entries"]) == 4
+
+
+# --- macOS diskutil interpretation -------------------------------------
+# `diskutil info -plist` only runs on macOS, so the subprocess is not exercised
+# off a Mac. The interpretation of its output is, using real captured output.
+
+DISKUTIL_REMOVABLE = b"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" \
+"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>DeviceIdentifier</key>
+	<string>disk2</string>
+	<key>DeviceNode</key>
+	<string>/dev/disk2</string>
+	<key>Whole</key>
+	<true/>
+	<key>Internal</key>
+	<false/>
+	<key>Ejectable</key>
+	<true/>
+	<key>RemovableMedia</key>
+	<true/>
+	<key>TotalSize</key>
+	<integer>4003447808</integer>
+	<key>DeviceBlockSize</key>
+	<integer>512</integer>
+	<key>VolumeName</key>
+	<string>DP-008EX</string>
+</dict>
+</plist>
+"""
+
+DISKUTIL_INTERNAL = DISKUTIL_REMOVABLE.replace(
+    b"""	<key>Ejectable</key>
+	<true/>
+	<key>RemovableMedia</key>
+	<true/>""",
+    b"""	<key>Ejectable</key>
+	<false/>
+	<key>RemovableMedia</key>
+	<false/>""",
+).replace(b"<string>DP-008EX</string>", b"<string>Macintosh HD</string>")
+
+DISKUTIL_NO_REMOVABLE_KEY = b"""<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>TotalSize</key>
+	<integer>1000204886016</integer>
+</dict>
+</plist>
+"""
+
+
+def test_parse_diskutil_plist_reads_size_and_removable():
+    from tascam_dp008ex_sd_audio_extractor.devices import parse_diskutil_plist
+
+    assert parse_diskutil_plist(DISKUTIL_REMOVABLE) == (4003447808, True)
+    assert parse_diskutil_plist(DISKUTIL_INTERNAL) == (4003447808, False)
+
+
+def test_parse_diskutil_plist_falls_back_to_ejectable():
+    from tascam_dp008ex_sd_audio_extractor.devices import parse_diskutil_plist
+
+    # A whole disk that only carries Ejectable must still be classified.
+    only_ejectable = DISKUTIL_REMOVABLE.replace(
+        b"""	<key>RemovableMedia</key>
+	<true/>""",
+        b"""	<key>SomethingElse</key>
+	<true/>""",
+    )
+    assert parse_diskutil_plist(only_ejectable) == (4003447808, True)
+    assert parse_diskutil_plist(DISKUTIL_NO_REMOVABLE_KEY) == (1000204886016, None)
+
+
+def test_parse_diskutil_plist_survives_garbage():
+    from tascam_dp008ex_sd_audio_extractor.devices import parse_diskutil_plist
+
+    assert parse_diskutil_plist(b"") == (None, None)
+    assert parse_diskutil_plist(b"not xml at all") == (None, None)
+    assert parse_diskutil_plist(b"<plist><array/></plist>") == (None, None)
+    assert parse_diskutil_plist(DISKUTIL_REMOVABLE.replace(b"4003447808", b"0")) == (
+        None,
+        True,
+    )
+
+
+def test_aligned_reader_close_is_idempotent(tmp_path):
+    p = tmp_path / "img.bin"
+    p.write_bytes(b"q" * 1024)
+    r = AlignedReader(p)
+    r.close()
+    r.close()  # must not raise
+    # Matches what open() does, rather than leaking OSError(EBADF).
+    with pytest.raises(ValueError, match="closed file"):
+        r.read(1)
+    with pytest.raises(ValueError, match="closed file"):
+        r.seek(0)

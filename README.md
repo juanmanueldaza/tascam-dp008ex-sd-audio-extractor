@@ -129,6 +129,23 @@ flag histogram + master/inode/extent counts.
 - Alloc @MTR+0x288000 (1MiB, 16384×64B): pool `0x80040003/0x80104900` ×256,
   no `0x80030000` masters / `0x9001000x` inodes on empty card
 
+## Permissions
+
+Reading a raw device needs privileges that are deliberately *not* requested at
+install time. Any of these work:
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Per command | `sudo … image /dev/sdb` | `sudo … image /dev/rdisk2` | Administrator shell |
+| Once, no sudo | `sudo usermod -aG disk $USER` then re-login | — | run as Administrator |
+| Revert the group | `sudo gpasswd -d $USER disk` | — | — |
+
+The `disk` group grants read access to *every* block device, so it is worth
+knowing it is there. Membership also does not apply to a shell that is already
+running — log out and back in, or use `newgrp disk -c '…'` for one command.
+
+The tool never opens a card for writing, and never needs it mounted.
+
 ## Platform support — and what is actually verified
 
 Being straight about the evidence, because "works on Linux, macOS and Windows" is
@@ -138,6 +155,7 @@ a claim that deserves receipts:
 |---|---|---|---|
 | Read a real card or image | **verified on hardware** | *not yet executed* | verified in CI |
 | `devices` discovery | sysfs (size/removable) | `/dev/disk*` + `diskutil` | `\\.\PhysicalDriveN` via `CreateFileW`/`DeviceIoControl` |
+| Unaligned reads on raw drives | n/a | n/a | sector-aligned reader |
 | Mounted-card warning | `/proc/self/mounts` | `mount` output | removable drive letters |
 | Tested on | a 4GB Tascam DP-008EX card | nothing yet | CI runner's `\\.\PhysicalDrive0` |
 | Python versions exercised | 3.10, 3.12, 3.14 | 3.12 | 3.10, 3.12, 3.14 |
@@ -146,19 +164,24 @@ a claim that deserves receipts:
   read from an actual card (`/dev/mmcblk0`), and `stems /dev/mmcblk0` produces
   output byte-identical to rendering the same card from an image.
 - **Windows** runs for real in CI, where the runner's own `\\.\PhysicalDrive0` is
-  opened and queried. That is how two bugs in the ctypes backend were caught:
-  the `STORAGE_PROPERTY_QUERY` buffer was undersized, so Windows rejected the
-  query and the removable flag silently came back unknown. A removable drive
-  letter is reported but deliberately *not* mapped to a physical drive — that
-  needs a device-stack walk, and guessing would be worse than saying so. Use
-  `\\.\PhysicalDrive0`, not `E:\`; `E:\` is a partition and is refused. Reading a
-  physical drive needs an Administrator shell.
+  opened and queried. That is how three real bugs in the ctypes backend were
+  caught, none of which type-checking could see:
+  1. `STORAGE_PROPERTY_QUERY` is 12 bytes once padded — sending two bare DWORDs made
+     Windows reject the query and the removable flag silently came back unknown.
+  2. The descriptor offset was wrong: RemovableMedia is byte 10, not byte 8. Byte 8
+     is the bus type, so the original code would have reported *every* disk as
+     removable.
+  3. Windows refuses a read that does not start on a sector boundary when the
+     handle is a raw physical drive — and the MBR partition table is read 64 bytes
+     at `0x1BE`. Image/device reads therefore go through a sector-aligning reader
+     rather than a buffered `open()`.
 - **macOS is the weakest link, and this table says so.** The code paths are
   implemented (`diskutil info -plist` for size and removable state, `mount` for
-  volumes, `/dev/rdisk*` for the raw node) and type-check against a Darwin target,
-  but the CI leg has been stuck in GitHub's macOS runner queue for hours at a time
-  and has **never executed**; that leg is therefore `continue-on-error`, so a
-  saturated runner pool cannot block releases. Nothing macOS-specific has been
+  volumes, `/dev/rdisk*` for the raw node) and the `diskutil` output parsing is
+  unit-tested against real captured output, but the CI leg has been stuck in
+  GitHub's macOS runner queue for hours at a time on both `macos-latest` and
+  `macos-13` and has **never executed**; that leg is therefore `continue-on-error`,
+  so a saturated runner pool cannot block releases. Nothing macOS-specific has been
   run against real hardware either. Use `/dev/rdisk2`, not `/dev/disk2` — the raw
   node skips the disk-arbiter cache and is several times faster.
 - **Multi-partition cards** are warned about, not silently mis-parsed: only

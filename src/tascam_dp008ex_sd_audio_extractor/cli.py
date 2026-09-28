@@ -24,6 +24,7 @@ from .devices import (
     is_removable,
     list_device_nodes,
     mounted_volumes,
+    open_device,
     privilege_hint,
 )
 from .extract import (
@@ -93,7 +94,7 @@ def cmd_devices(probe=True):
                 contents = f"unreadable ({privilege_hint()})"
             elif probe:
                 try:
-                    with open(node, "rb") as f:
+                    with open_device(node) as f:
                         mbr = parse_mbr(f)
                         base, end = mtr_bounds(mbr)
                         if base >= end:
@@ -199,7 +200,7 @@ def _s16(buf, off):
 
 
 def cmd_list(img_path):
-    with open(img_path, "rb") as f:
+    with open_device(img_path) as f:
         mbr = parse_mbr(f)
         print(
             f"total: {mbr['total_bytes']} bytes ({mbr['total_bytes'] / 1e9:.3f} GB, {mbr['total_sectors']} sectors) sig_ok={mbr['sig_ok']}"
@@ -257,7 +258,7 @@ def cmd_list(img_path):
 
 
 def cmd_carve(img_path, stride=16, limit=0, dump_top=0, out_dir="carve_out"):
-    with open(img_path, "rb") as f:
+    with open_device(img_path) as f:
         mbr = parse_mbr(f)
         base, end = mtr_bounds(mbr)
         total_c = (end - (base + POOL_OFF)) // CLUSTER
@@ -293,7 +294,7 @@ def cmd_carve(img_path, stride=16, limit=0, dump_top=0, out_dir="carve_out"):
 
 
 def cmd_extract_all(img_path, out_dir="out"):
-    with open(img_path, "rb") as f:
+    with open_device(img_path) as f:
         mbr = parse_mbr(f)
         base, end = mtr_bounds(mbr)
         recs = read_alloc(f, base)
@@ -316,7 +317,7 @@ def cmd_extract_all(img_path, out_dir="out"):
 
 
 def cmd_stems(img_path, out_dir="stems_out"):
-    with open(img_path, "rb") as f:
+    with open_device(img_path) as f:
         mbr = parse_mbr(f)
         base, end = mtr_bounds(mbr)
         recs = read_alloc(f, base, flags=STEM_FLAGS)
@@ -351,7 +352,7 @@ def cmd_verify(img_path):
         if not cond:
             fails.append(name)
 
-    with open(img_path, "rb") as f:
+    with open_device(img_path) as f:
         mbr = parse_mbr(f)
         base, end = mtr_bounds(mbr)
         recs = read_alloc(f, base)

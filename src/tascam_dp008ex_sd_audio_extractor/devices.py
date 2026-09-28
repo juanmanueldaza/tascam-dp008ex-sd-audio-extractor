@@ -122,14 +122,39 @@ def _sysfs(name, attr):
         return None
 
 
+def parse_diskutil_plist(blob):
+    """(size_bytes, removable) from `diskutil info -plist` output.
+
+    Split out from the subprocess call so the macOS interpretation can be tested
+    on any platform; a Mac is the only place the OS actually runs it.
+    """
+    import plistlib
+    from xml.parsers.expat import ExpatError
+
+    try:
+        info = plistlib.loads(blob)
+    except (ExpatError, ValueError, TypeError):
+        return (None, None)
+    if not isinstance(info, dict):
+        return (None, None)
+    size = info.get("TotalSize")
+    removable = info.get("RemovableMedia")
+    if removable is None:
+        # Whole disks report Ejectable rather than RemovableMedia.
+        removable = info.get("Ejectable")
+    return (
+        int(size) if isinstance(size, int) and size > 0 else None,
+        bool(removable) if isinstance(removable, bool) else None,
+    )
+
+
 def _darwin_disk_info(path):
-    """(size_bytes, removable) from `diskutil info -plist`, or (None, None).
+    """(size_bytes, removable) for a /dev/diskN node, or (None, None).
 
     macOS has no /sys and device nodes report size 0, so diskutil is the
     reliable source. It ships with the OS; subprocess and plistlib are stdlib,
     so the package still has zero third-party dependencies.
     """
-    import plistlib
     import subprocess
     import sys
 
@@ -142,19 +167,9 @@ def _darwin_disk_info(path):
             timeout=15,
             check=False,
         )
-        info = plistlib.loads(done.stdout)
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError):
         return (None, None)
-    if not isinstance(info, dict):
-        return (None, None)
-    size = info.get("TotalSize")
-    removable = info.get("RemovableMedia")
-    if removable is None:
-        removable = info.get("Ejectable")
-    return (
-        int(size) if isinstance(size, int) and size > 0 else None,
-        bool(removable) if isinstance(removable, bool) else None,
-    )
+    return parse_diskutil_plist(done.stdout)
 
 
 def device_size(path):
@@ -203,6 +218,101 @@ def can_read(path):
         return True
     except OSError:
         return False
+
+
+class AlignedReader:
+    """Byte-exact reader for raw devices, with sector-aligned I/O.
+
+    Windows rejects a read that does not start on a sector boundary when the
+    handle is a raw ``\\\\.\\PhysicalDriveN``, and the MBR partition table is read
+    64 bytes at 0x1BE, so an ordinary buffered open dies with OSError partway
+    through probing a card. Every read is therefore issued from the sector that
+    contains it and the result sliced down. Buffering is bypassed so no hidden
+    unaligned prefetch can reintroduce the same problem.
+
+    Behaves like a binary file object for the parts this package uses: seek,
+    read, tell, close, and the context-manager protocol.
+    """
+
+    def __init__(self, path):
+        self._fd: int = os.open(str(path), os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        self._closed = False
+        try:
+            self._pos = 0
+            self._size = os.lseek(self._fd, 0, os.SEEK_END)
+        except OSError:
+            os.close(self._fd)
+            self._closed = True
+            raise
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self._pos
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        if self._closed:
+            raise ValueError("I/O operation on closed file")
+        if whence == os.SEEK_SET:
+            self._pos = offset
+        elif whence == os.SEEK_CUR:
+            self._pos += offset
+        elif whence == os.SEEK_END:
+            self._pos = self._size + offset
+        else:
+            raise ValueError(f"invalid whence {whence!r}")
+        return self._pos
+
+    def read(self, size=-1):
+        if self._closed:
+            raise ValueError("I/O operation on closed file")
+        if size is None or size < 0:
+            size = max(0, self._size - self._pos)
+        if size == 0 or self._pos >= self._size:
+            return b""
+        sector = 512
+        start = self._pos
+        skip = start % sector
+        want = skip + size
+        want = -(-want // sector) * sector  # round up to a whole sector
+        os.lseek(self._fd, start - skip, os.SEEK_SET)
+        buf = os.read(self._fd, want)
+        if len(buf) <= skip:
+            self._pos = self._size
+            return b""
+        out = buf[skip : skip + size]
+        # Advance by what the caller was given, not by the sector-rounded
+        # amount actually pulled from the device: after read(64) from offset 0 a
+        # file object must report position 64, not 512.
+        self._pos = start + len(out)
+        return out
+
+    def close(self):
+        if not self._closed:
+            os.close(self._fd)
+            self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+def open_device(path, mode="rb"):
+    """Open an image or a raw device for reading, aligned where it matters.
+
+    Plain files get a normal buffered open. Raw Windows physical drives get
+    AlignedReader, because that is the only way a 64-byte read at 0x1BE works.
+    """
+    if "r" in mode and "+" not in mode and WIN_WHOLE.match(str(path)):
+        return AlignedReader(path)
+    return open(path, mode)
 
 
 def privilege_hint():

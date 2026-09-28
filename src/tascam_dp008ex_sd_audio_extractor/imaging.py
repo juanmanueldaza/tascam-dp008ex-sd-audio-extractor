@@ -16,6 +16,7 @@ from .devices import (
     device_size,
     is_block_device,
     is_partition_node,
+    open_device,
     partition_hint,
 )
 
@@ -26,7 +27,7 @@ def sha256_file(path, chunk=CHUNK, on_progress=None):
     """(digest, bytes_read) for a file or device, streamed."""
     h = hashlib.sha256()
     done = 0
-    with open(path, "rb") as f:
+    with open_device(path) as f:
         while True:
             block = f.read(chunk)
             if not block:
@@ -131,7 +132,7 @@ def image_device(
     started = time.monotonic()
     written = start
     digest = hashlib.sha256()
-    with open(src, "rb") as r, open(dst, "r+b" if resuming else "wb") as w:
+    with open_device(src) as r, open(dst, "r+b" if resuming else "wb") as w:
         if resuming:
             # Hash the existing prefix so the reported digest covers the whole file.
             with open(dst, "rb") as pre:
