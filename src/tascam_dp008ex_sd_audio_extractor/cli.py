@@ -72,10 +72,13 @@ def cmd_devices(probe=True):
     """List candidate whole devices and, when readable, what audio they hold."""
     nodes = list_device_nodes()
     if not nodes:
-        print(
-            "no candidate block devices found (looked for /dev/sd*, /dev/nvme*, "
-            "/dev/mmcblk*, /dev/disk*)"
-        )
+        if os.name == "nt":
+            print(r"no candidate block devices found (looked for \\.\PhysicalDriveN)")
+        else:
+            print(
+                "no candidate block devices found (looked for /dev/sd*, /dev/nvme*, "
+                "/dev/mmcblk*, /dev/disk*)"
+            )
         print("on macOS use the whole disk (/dev/rdiskN), not /dev/diskNs1")
         return
     print(f"{'DEVICE':22} {'SIZE':>11}  REMOVABLE  CONTENTS")
@@ -131,7 +134,11 @@ def cmd_image(src, dst, chunk_mb=8, verify=True, resume=False, overwrite=False):
         pct = f"{done / total * 100:5.1f}%" if total else "  ?  "
         rate = done / max(1e-9, now - started[0]) / 1024 / 1024
         # Redraw in place on a terminal; plain lines when piped to a file.
-        print(f"  {pct}  {human(done)}  {rate:.0f} MiB/s", end="\n" if not tty else "")
+        print(
+            f"  {pct}  {human(done)}  {rate:.0f} MiB/s",
+            end="\r" if tty else "\n",
+            flush=True,
+        )
 
     started[0] = time.monotonic()
     print(f"imaging {src} -> {dst} (read-only source)", flush=True)

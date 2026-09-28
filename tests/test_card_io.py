@@ -189,7 +189,17 @@ def test_image_refuses_missing_source(tmp_path):
         image_device(str(tmp_path / "nope.img"), str(tmp_path / "out.img"))
 
 
-def test_image_refuses_a_device_as_destination(tmp_path):
+def test_image_refuses_a_non_regular_destination(tmp_path):
+    """A directory stands in for any non-regular destination, on every platform."""
+    src = source_file(tmp_path)
+    d = tmp_path / "a-directory"
+    d.mkdir()
+    with pytest.raises(ValueError, match="not a regular file"):
+        image_device(str(src), str(d))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX character device")
+def test_image_refuses_a_character_device(tmp_path):
     src = source_file(tmp_path)
     with pytest.raises(ValueError, match="not a regular file"):
         image_device(str(src), "/dev/null")
