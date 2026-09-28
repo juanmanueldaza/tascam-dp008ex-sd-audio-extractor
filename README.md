@@ -136,26 +136,31 @@ a claim that deserves receipts:
 
 | | Linux | macOS | Windows |
 |---|---|---|---|
-| Read a real card or image | **verified on hardware** | verified in CI | verified in CI |
+| Read a real card or image | **verified on hardware** | *not yet executed* | verified in CI |
 | `devices` discovery | sysfs (size/removable) | `/dev/disk*` + `diskutil` | `\\.\PhysicalDriveN` via `CreateFileW`/`DeviceIoControl` |
 | Mounted-card warning | `/proc/self/mounts` | `mount` output | removable drive letters |
-| Tested on | a 4GB Tascam DP-008EX card | CI runner | CI runner |
+| Tested on | a 4GB Tascam DP-008EX card | nothing yet | CI runner's `\\.\PhysicalDrive0` |
 | Python versions exercised | 3.10, 3.12, 3.14 | 3.12 | 3.10, 3.12, 3.14 |
 
 - **Linux** is the only platform with real hardware behind it. Everything below was
   read from an actual card (`/dev/mmcblk0`), and `stems /dev/mmcblk0` produces
   output byte-identical to rendering the same card from an image.
-- **macOS** runs its own code path in CI (`diskutil info -plist` for size and
-  removable state, `mount` for volumes, `/dev/rdisk*` for the raw node) but has not
-  been tested against a physical DP-008EX. Only 3.12 is exercised there: GitHub's
-  hosted macOS pool queues for hours, and one leg that runs beats three that sit
-  pending. Use `/dev/rdisk2`, not `/dev/disk2` — the raw node skips the disk-arbiter
-  cache and is several times faster.
-- **Windows** likewise runs for real in CI, where the runner's own
-  `\\.\PhysicalDrive0` is opened and queried. A removable drive letter is reported,
-  but it is *not* mapped to a physical drive: that needs a device-stack walk, and
-  guessing would be worse than saying so. Use `\\.\PhysicalDrive0`, not `E:\` —
-  `E:\` is a partition and is refused.
+- **Windows** runs for real in CI, where the runner's own `\\.\PhysicalDrive0` is
+  opened and queried. That is how two bugs in the ctypes backend were caught:
+  the `STORAGE_PROPERTY_QUERY` buffer was undersized, so Windows rejected the
+  query and the removable flag silently came back unknown. A removable drive
+  letter is reported but deliberately *not* mapped to a physical drive — that
+  needs a device-stack walk, and guessing would be worse than saying so. Use
+  `\\.\PhysicalDrive0`, not `E:\`; `E:\` is a partition and is refused. Reading a
+  physical drive needs an Administrator shell.
+- **macOS is the weakest link, and this table says so.** The code paths are
+  implemented (`diskutil info -plist` for size and removable state, `mount` for
+  volumes, `/dev/rdisk*` for the raw node) and type-check against a Darwin target,
+  but the CI leg has been stuck in GitHub's macOS runner queue for hours at a time
+  and has **never executed**; that leg is therefore `continue-on-error`, so a
+  saturated runner pool cannot block releases. Nothing macOS-specific has been
+  run against real hardware either. Use `/dev/rdisk2`, not `/dev/disk2` — the raw
+  node skips the disk-arbiter cache and is several times faster.
 - **Multi-partition cards** are warned about, not silently mis-parsed: only
   partition 0 is used to locate the MTR, so `verify`/`list` warn if a card declares
   more than one. A real DP-008EX always has exactly one.

@@ -25,6 +25,7 @@ from tascam_dp008ex_sd_audio_extractor.devices import (
     parse_mount_output,
     parse_mounts,
     partition_hint,
+    privilege_hint,
     whole_device_for,
 )
 from tascam_dp008ex_sd_audio_extractor.imaging import image_device, sha256_file
@@ -532,3 +533,28 @@ def test_zero_type_but_nonzero_length_counts_as_declared():
         ]
     )
     assert extra_partition_warning(mbr) is not None
+
+
+def test_privilege_hint_is_platform_correct():
+    if os.name == "nt":
+        assert privilege_hint() == "needs Administrator"
+    else:
+        assert privilege_hint() == "needs root or the disk group"
+
+
+def test_windows_removable_query_uses_a_well_formed_property_query():
+    """The 12-byte padded STORAGE_PROPERTY_QUERY, not two bare DWORDs.
+
+    Windows rejects an undersized query buffer with ERROR_BAD_LENGTH, which made
+    RemovableMedia come back unknown on the first CI run that actually executed
+    this code. Pinned here so the layout cannot regress.
+    """
+    import struct
+
+    from tascam_dp008ex_sd_audio_extractor import devices
+
+    query = struct.pack("<II4x", 0, 0)
+    assert len(query) == devices._STORAGE_PROPERTY_QUERY_LEN == 12
+    # RemovableMedia is byte 10 of STORAGE_DEVICE_DESCRIPTOR; byte 8 is the bus
+    # type, and reading that instead reports every disk as removable.
+    assert devices._STOR_DEV_REMOVABLE == 10

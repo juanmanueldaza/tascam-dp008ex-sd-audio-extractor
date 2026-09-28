@@ -205,6 +205,13 @@ def can_read(path):
         return False
 
 
+def privilege_hint():
+    """What this platform actually requires to read a raw device."""
+    if os.name == "nt":
+        return "needs Administrator"
+    return "needs root or the disk group"
+
+
 # --- Windows -----------------------------------------------------------
 # ctypes.windll / ctypes.wintypes only exist on Windows, so they are reached
 # through getattr(): the module has to import (and type-check) on Linux/macOS.
@@ -215,7 +222,15 @@ _SHARE_READ_WRITE = 0x00000003
 _OPEN_EXISTING = 3
 _IOCTL_DISK_GET_LENGTH_INFO = 0x7405C
 _IOCTL_STORAGE_QUERY_PROPERTY = 0x2D1400
-_STORAGE_PROPERTY_QUERY = 0
+# STORAGE_PROPERTY_QUERY { DWORD PropertyId; DWORD QueryType; UCHAR Extra[1]; } is
+# 12 bytes once padded. Sending only the two DWORDs makes Windows reject the
+# query with ERROR_BAD_LENGTH, which is how the removable flag silently came
+# back unknown.
+_STORAGE_PROPERTY_QUERY_LEN = 12
+# STORAGE_DEVICE_DESCRIPTOR field offsets: Version@0, Size@4, DeviceType@8,
+# DeviceTypeModifier@9, RemovableMedia@10. Reading @8 would report the bus type
+# as if it were the removable flag.
+_STOR_DEV_REMOVABLE = 10
 _DRIVE_REMOVABLE = 2
 _MAX_PHYSICAL_DRIVES = 32
 
@@ -304,8 +319,9 @@ def _win_device_info(path):
             size = struct.unpack("<Q", buf.raw[:8])[0] or None
 
         removable = None
-        # STORAGE_PROPERTY_QUERY { DWORD PropertyId; DWORD QueryType; BYTE Extra[1]; }
-        query = struct.pack("<II", _STORAGE_PROPERTY_QUERY, 0)
+        # PropertyId=StorageDeviceProperty (0), QueryType=0. The struct is 12
+        # bytes once padded; sending only the two DWORDs gets the query rejected.
+        query = struct.pack("<II4x", 0, 0)
         desc = ctypes.create_string_buffer(256)
         if k32.DeviceIoControl(
             handle,
@@ -317,8 +333,7 @@ def _win_device_info(path):
             ctypes.byref(returned),
             None,
         ):
-            # STORAGE_DEVICE_DESCRIPTOR: ... DeviceType@6, RemovableMedia@8
-            removable = bool(desc.raw[8])
+            removable = bool(desc.raw[_STOR_DEV_REMOVABLE])
         return (size, removable)
     finally:
         k32.CloseHandle(handle)

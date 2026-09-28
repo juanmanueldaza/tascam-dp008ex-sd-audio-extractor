@@ -24,6 +24,7 @@ from .devices import (
     is_removable,
     list_device_nodes,
     mounted_volumes,
+    privilege_hint,
 )
 from .extract import (
     HALF,
@@ -89,7 +90,7 @@ def cmd_devices(probe=True):
             rem = {True: "yes", False: "no", None: "?"}[removable]
             contents = "-"
             if not can_read(node):
-                contents = "unreadable (needs root or the disk group)"
+                contents = f"unreadable ({privilege_hint()})"
             elif probe:
                 try:
                     with open(node, "rb") as f:
