@@ -79,36 +79,40 @@ def cmd_devices(probe=True):
                 "no candidate block devices found (looked for /dev/sd*, /dev/nvme*, "
                 "/dev/mmcblk*, /dev/disk*)"
             )
-        print("on macOS use the whole disk (/dev/rdiskN), not /dev/diskNs1")
-        return
-    print(f"{'DEVICE':22} {'SIZE':>11}  REMOVABLE  CONTENTS")
-    for node in nodes:
-        size = device_size(node)
-        removable = is_removable(node)
-        rem = {True: "yes", False: "no", None: "?"}[removable]
-        contents = "-"
-        if not can_read(node):
-            contents = "unreadable (needs root or the disk group)"
-        elif probe:
-            try:
-                with open(node, "rb") as f:
-                    mbr = parse_mbr(f)
-                    base, end = mtr_bounds(mbr)
-                    if base >= end:
-                        contents = "no MTR region"
-                    else:
-                        masters = collect_chains(read_alloc(f, base))
-                        stems = collect_chains(
-                            read_alloc(f, base, flags=STEM_FLAGS), STEM_FLAGS
-                        )
-                        contents = f"{len(masters)} master chain(s), {len(stems)} stem chain(s)"
-            except (OSError, ValueError) as e:
-                contents = f"unreadable ({type(e).__name__})"
-        print(f"{node:22} {human(size):>11}  {rem:9}  {contents}")
+    else:
+        print(f"{'DEVICE':22} {'SIZE':>11}  REMOVABLE  CONTENTS")
+        for node in nodes:
+            size = device_size(node)
+            removable = is_removable(node)
+            rem = {True: "yes", False: "no", None: "?"}[removable]
+            contents = "-"
+            if not can_read(node):
+                contents = "unreadable (needs root or the disk group)"
+            elif probe:
+                try:
+                    with open(node, "rb") as f:
+                        mbr = parse_mbr(f)
+                        base, end = mtr_bounds(mbr)
+                        if base >= end:
+                            contents = "no MTR region"
+                        else:
+                            masters = collect_chains(read_alloc(f, base))
+                            stems = collect_chains(
+                                read_alloc(f, base, flags=STEM_FLAGS), STEM_FLAGS
+                            )
+                            contents = (
+                                f"{len(masters)} master chain(s), "
+                                f"{len(stems)} stem chain(s)"
+                            )
+                except (OSError, ValueError) as e:
+                    contents = f"unreadable ({type(e).__name__})"
+            print(f"{node:22} {human(size):>11}  {rem:9}  {contents}")
     if probe:
         print(
             "\nA DP-008EX card shows master and stem chains. Other media usually show none."
         )
+    # Always print the guidance: it matters most when no device was found.
+    print("on macOS use the whole disk (/dev/rdiskN), not /dev/diskNs1")
     print(
         "Partition nodes (/dev/sdb1, /dev/disk2s1) are never the right input: the "
         "songs live outside every partition."
