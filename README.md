@@ -153,9 +153,9 @@ a claim that deserves receipts:
 
 | | Linux | macOS | Windows |
 |---|---|---|---|
-| Read a real card or image | **verified on hardware** | *not yet executed* | verified in CI |
+| Read a real card or image | **verified on hardware** | *not yet executed* | verified on a real physical drive (CI) |
 | `devices` discovery | sysfs (size/removable) | `/dev/disk*` + `diskutil` | `\\.\PhysicalDriveN` via `CreateFileW`/`DeviceIoControl` |
-| Unaligned reads on raw drives | n/a | n/a | sector-aligned reader |
+| Unaligned reads on raw drives | n/a | n/a | sector-aligned reader, verified |
 | Mounted-card warning | `/proc/self/mounts` | `mount` output | removable drive letters |
 | Tested on | a 4GB Tascam DP-008EX card | nothing yet | CI runner's `\\.\PhysicalDrive0` |
 | Python versions exercised | 3.10, 3.12, 3.14 | 3.12 | 3.10, 3.12, 3.14 |
@@ -174,7 +174,13 @@ a claim that deserves receipts:
   3. Windows refuses a read that does not start on a sector boundary when the
      handle is a raw physical drive — and the MBR partition table is read 64 bytes
      at `0x1BE`. Image/device reads therefore go through a sector-aligning reader
-     rather than a buffered `open()`.
+     rather than a buffered `open()`. It also cannot `SEEK_END` such a handle, so
+     the size comes from `DeviceIoControl`. CI proves the whole path: the runner's
+     own `\\.\PhysicalDrive0` is read, its MBR parsed, and it is correctly reported
+     as `no MTR region` (a Windows disk is not a DP-008EX card). A removable drive
+     letter is reported but deliberately *not* mapped to a physical drive — that
+     needs a device-stack walk, and guessing would be worse than saying so. Use
+     `\\.\PhysicalDrive0`, not `E:\`; `E:\` is a partition and is refused.
 - **macOS is the weakest link, and this table says so.** The code paths are
   implemented (`diskutil info -plist` for size and removable state, `mount` for
   volumes, `/dev/rdisk*` for the raw node) and the `diskutil` output parsing is
