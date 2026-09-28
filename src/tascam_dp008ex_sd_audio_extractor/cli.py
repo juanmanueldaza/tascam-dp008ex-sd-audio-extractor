@@ -35,7 +35,7 @@ from .extract import (
 )
 from .header import parse_header
 from .imaging import image_device
-from .mbr import mtr_bounds, parse_mbr
+from .mbr import extra_partition_warning, mtr_bounds, parse_mbr
 from .scan import find_bfs_roots, scan_alloc_table, scan_song_slots
 from .stems import FRAG, FRAG_SAMPLES, RAW_SECTOR, STEM_FLAGS, render_stem
 from .wavio import RATE, pcm_stats, write_wav
@@ -211,6 +211,9 @@ def cmd_list(img_path):
         print(
             f"MTR_BASE={base} ({base:#x}) sector={base // 512} size={(end - base) / 1e9:.3f} GB"
         )
+        warn = extra_partition_warning(mbr)
+        if warn:
+            print(f"warning: {warn}")
         hdr = parse_header(f, base)
         print(
             f"header magic={hdr['magic']:#010x} sector_size={hdr['sector_size']} reserved={hdr['reserved_sectors']}s/{hdr['reserved_bytes']}B"
@@ -485,6 +488,9 @@ def cmd_verify(img_path):
             else "no fragments",
         )
 
+    warn = extra_partition_warning(mbr)
+    if warn:
+        print(f"warning: {warn}")
     print(("VERIFY FAIL: " + ", ".join(fails)) if fails else "VERIFY PASS")
     return 1 if fails else 0
 

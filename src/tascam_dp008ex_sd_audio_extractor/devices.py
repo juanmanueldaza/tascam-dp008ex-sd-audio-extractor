@@ -122,9 +122,49 @@ def _sysfs(name, attr):
         return None
 
 
+def _darwin_disk_info(path):
+    """(size_bytes, removable) from `diskutil info -plist`, or (None, None).
+
+    macOS has no /sys and device nodes report size 0, so diskutil is the
+    reliable source. It ships with the OS; subprocess and plistlib are stdlib,
+    so the package still has zero third-party dependencies.
+    """
+    import plistlib
+    import subprocess
+    import sys
+
+    if sys.platform != "darwin":
+        return (None, None)
+    try:
+        done = subprocess.run(
+            ["diskutil", "info", "-plist", str(path)],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        info = plistlib.loads(done.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return (None, None)
+    if not isinstance(info, dict):
+        return (None, None)
+    size = info.get("TotalSize")
+    removable = info.get("RemovableMedia")
+    if removable is None:
+        removable = info.get("Ejectable")
+    return (
+        int(size) if isinstance(size, int) and size > 0 else None,
+        bool(removable) if isinstance(removable, bool) else None,
+    )
+
+
 def device_size(path):
     """Size in bytes, or None when it cannot be determined without privileges."""
     p = str(path)
+    if WIN_WHOLE.match(p):
+        return _win_device_info(p)[0]
+    size, _ = _darwin_disk_info(p)
+    if size is not None:
+        return size
     name = os.path.basename(p)
     if os.path.isdir("/sys/class/block"):
         raw = _sysfs(name, "size")
@@ -140,8 +180,14 @@ def device_size(path):
 
 
 def is_removable(path):
-    """True/False from sysfs, else None (unknown on macOS/Windows)."""
-    name = os.path.basename(str(path))
+    """True/False from the platform, else None (unknown)."""
+    p = str(path)
+    if WIN_WHOLE.match(p):
+        return _win_device_info(p)[1]
+    _, removable = _darwin_disk_info(p)
+    if removable is not None:
+        return removable
+    name = os.path.basename(p)
     if not os.path.isdir("/sys/class/block"):
         return None
     raw = _sysfs(name, "removable")
@@ -159,8 +205,166 @@ def can_read(path):
         return False
 
 
+# --- Windows -----------------------------------------------------------
+# ctypes.windll / ctypes.wintypes only exist on Windows, so they are reached
+# through getattr(): the module has to import (and type-check) on Linux/macOS.
+# No third-party dependency, no subprocess.
+
+_GENERIC_READ = 0x80000000
+_SHARE_READ_WRITE = 0x00000003
+_OPEN_EXISTING = 3
+_IOCTL_DISK_GET_LENGTH_INFO = 0x7405C
+_IOCTL_STORAGE_QUERY_PROPERTY = 0x2D1400
+_STORAGE_PROPERTY_QUERY = 0
+_DRIVE_REMOVABLE = 2
+_MAX_PHYSICAL_DRIVES = 32
+
+
+def _kernel32():
+    import ctypes
+
+    dll = getattr(ctypes, "WinDLL", None)
+    if dll is None:  # not Windows
+        return None
+    k32 = dll("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = ctypes.c_void_p
+    k32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+    ]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    k32.CloseHandle.restype = ctypes.c_int
+    k32.DeviceIoControl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.c_void_p,
+    ]
+    k32.DeviceIoControl.restype = ctypes.c_int
+    k32.GetLogicalDrives.restype = ctypes.c_ulong
+    k32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
+    k32.GetDriveTypeW.restype = ctypes.c_ulong
+    return k32
+
+
+def _win_open(k32, path):
+    import ctypes
+
+    handle = k32.CreateFileW(
+        path,
+        _GENERIC_READ,
+        _SHARE_READ_WRITE,
+        None,
+        _OPEN_EXISTING,
+        0,
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if handle is None or handle == invalid:
+        return None
+    return handle
+
+
+def _win_device_info(path):
+    """(size_bytes, removable) for a \\\\.\\PhysicalDriveN node, or (None, None)."""
+    if os.name != "nt":
+        return (None, None)
+    k32 = _kernel32()
+    if k32 is None:
+        return (None, None)
+    import ctypes
+    import struct
+
+    handle = _win_open(k32, str(path))
+    if handle is None:
+        return (None, None)
+    try:
+        size = None
+        buf = ctypes.create_string_buffer(8)
+        returned = ctypes.c_ulong(0)
+        if k32.DeviceIoControl(
+            handle,
+            _IOCTL_DISK_GET_LENGTH_INFO,
+            None,
+            0,
+            buf,
+            8,
+            ctypes.byref(returned),
+            None,
+        ):
+            size = struct.unpack("<Q", buf.raw[:8])[0] or None
+
+        removable = None
+        # STORAGE_PROPERTY_QUERY { DWORD PropertyId; DWORD QueryType; BYTE Extra[1]; }
+        query = struct.pack("<II", _STORAGE_PROPERTY_QUERY, 0)
+        desc = ctypes.create_string_buffer(256)
+        if k32.DeviceIoControl(
+            handle,
+            _IOCTL_STORAGE_QUERY_PROPERTY,
+            query,
+            len(query),
+            desc,
+            256,
+            ctypes.byref(returned),
+            None,
+        ):
+            # STORAGE_DEVICE_DESCRIPTOR: ... DeviceType@6, RemovableMedia@8
+            removable = bool(desc.raw[8])
+        return (size, removable)
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _win_physical_drives():
+    """Every \\\\.\\PhysicalDriveN the OS lets us open, in numeric order."""
+    if os.name != "nt":
+        return []
+    k32 = _kernel32()
+    if k32 is None:
+        return []
+    out = []
+    for n in range(_MAX_PHYSICAL_DRIVES):
+        node = rf"\\.\PhysicalDrive{n}"
+        handle = _win_open(k32, node)
+        if handle is not None:
+            k32.CloseHandle(handle)
+            out.append(node)
+    return out
+
+
+def _win_removable_drives():
+    """Drive letters Windows reports as removable, e.g. ['E:']."""
+    if os.name != "nt":
+        return []
+    k32 = _kernel32()
+    if k32 is None:
+        return []
+    mask = k32.GetLogicalDrives()
+    out = []
+    for i in range(26):
+        if mask & (1 << i):
+            root = f"{chr(ord('A') + i)}:\\"
+            if k32.GetDriveTypeW(root) == _DRIVE_REMOVABLE:
+                out.append(f"{chr(ord('A') + i)}:")
+    return out
+
+
 def list_device_nodes():
-    """Candidate whole-device nodes on this platform (stdlib only, no subprocess)."""
+    """Candidate whole-device nodes on this platform.
+
+    Linux/macOS: glob /dev. Windows: ask the OS which \\\\.\\PhysicalDriveN nodes
+    exist (there is no /dev, and inventing names would be a guess). Either way,
+    every node returned is filtered through is_whole_device().
+    """
     import glob
 
     found = set()
@@ -169,6 +373,7 @@ def list_device_nodes():
     if os.path.isdir("/dev"):
         found.update(glob.glob("/dev/disk[0-9]*"))
         found.update(glob.glob("/dev/rdisk[0-9]*"))
+    found.update(_win_physical_drives())
     return sorted(p for p in found if is_whole_device(p))
 
 
@@ -185,20 +390,63 @@ def parse_mounts(text):
     return out
 
 
-def mounted_volumes(path="/proc/self/mounts", only=None):
+def parse_mount_output(text):
+    """Parse BSD/macOS `mount` output into (device, mountpoint, fstype).
+
+    /dev/disk2s1 on /Volumes/DP-008EX (msdos, local, nodev, nosuid)
+    """
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("/dev/") or " on " not in line:
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        fstype = ""
+        if "(" in line:
+            fstype = line[line.rfind("(") + 1 :].split(",")[0].split(")")[0]
+        out.append((parts[0], parts[2], fstype.lower()))
+    return out
+
+
+def _mount_table():
+    """(device, mountpoint, fstype) triples from whatever this OS provides."""
+    if os.path.isfile("/proc/self/mounts"):
+        try:
+            with open("/proc/self/mounts") as f:
+                return parse_mounts(f.read())
+        except OSError:
+            pass
+    if os.name == "nt":
+        return []
+    import subprocess
+
+    try:
+        done = subprocess.run(["mount"], capture_output=True, timeout=15, check=False)
+        return parse_mount_output(done.stdout.decode("utf-8", "replace"))
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
+def mounted_volumes(path=None, only=None):
     """Mounted volumes that sit on a candidate device.
 
     A mounted DP-008EX card looks empty, which is the trap: the songs are not on
     the filesystem. This surfaces the mount and the whole device that actually
     holds them. `only` filters by filesystem type (e.g. {"vfat", "exfat"}).
+    `path` reads a specific /proc/mounts file instead of the platform default.
     """
-    try:
-        with open(path) as f:
-            text = f.read()
-    except OSError:
-        return []
-    found = []
-    for device, mountpoint, fstype in parse_mounts(text):
+    if path is not None:
+        try:
+            with open(path) as f:
+                table = parse_mounts(f.read())
+        except OSError:
+            return []
+    else:
+        table = _mount_table()
+    volumes = []
+    for device, mountpoint, fstype in table:
         if only and fstype not in only:
             continue
         whole = whole_device_for(device) or (
@@ -207,7 +455,7 @@ def mounted_volumes(path="/proc/self/mounts", only=None):
         if whole is None:
             continue
         label = os.path.basename(mountpoint.rstrip("/")) or mountpoint
-        found.append(
+        volumes.append(
             {
                 "partition": device,
                 "whole": whole,
@@ -218,4 +466,18 @@ def mounted_volumes(path="/proc/self/mounts", only=None):
                 or "dp008" in label.lower(),
             }
         )
-    return found
+    # Windows: a removable drive letter cannot be mapped to its physical drive
+    # without walking the device stack, so report it without guessing.
+    for letter in _win_removable_drives():
+        label = letter.rstrip(":")
+        volumes.append(
+            {
+                "partition": f"{label}:\\",
+                "whole": "see the physical drives listed above",
+                "mountpoint": f"{label}:\\",
+                "fstype": "removable",
+                "label": label,
+                "looks_like_dp008ex": False,
+            }
+        )
+    return volumes

@@ -15,15 +15,24 @@ from tascam_dp008ex_sd_audio_extractor.cli import main
 from tascam_dp008ex_sd_audio_extractor.devices import (
     PartitionNodeError,
     check_read_target,
+    device_size,
     is_block_device,
     is_partition_node,
+    is_removable,
     is_whole_device,
+    list_device_nodes,
     mounted_volumes,
+    parse_mount_output,
     parse_mounts,
     partition_hint,
     whole_device_for,
 )
 from tascam_dp008ex_sd_audio_extractor.imaging import image_device, sha256_file
+from tascam_dp008ex_sd_audio_extractor.mbr import (
+    extra_partition_warning,
+    mtr_bounds,
+    nonempty_partitions,
+)
 
 WHOLE = [
     "/dev/sda",
@@ -353,3 +362,173 @@ def test_cli_refuses_partition_node(tmp_path, capsys):
 def test_cli_image_missing_out_is_a_usage_error(capsys):
     with pytest.raises(SystemExit):
         main(["image", "/dev/sdb"])
+
+
+# --- platform backends -------------------------------------------------
+# These run on every OS in CI, so the Linux/macOS/Windows branches of the
+# discovery code are executed for real, not merely type-checked.
+
+_REAL_FSTYPES = {
+    "vfat",
+    "exfat",
+    "msdos",
+    "msdosfs",
+    "fat",
+    "fat32",
+    "ntfs",
+    "ntfs3",
+    "hfs",
+    "hfsplus",
+    "apfs",
+    "ext4",
+    "ext3",
+    "xfs",
+    "btrfs",
+}
+
+
+def test_list_device_nodes_returns_only_whole_devices():
+    nodes = list_device_nodes()
+    assert nodes == sorted(set(nodes)), "sorted and de-duplicated"
+    for node in nodes:
+        assert is_whole_device(node), node
+        assert not is_partition_node(node), node
+
+
+def test_device_size_and_removable_agree_for_discovered_nodes():
+    """At least one node must yield a real size on a machine that has disks.
+
+    This is the assertion that fails loudly if the Windows CreateFileW/
+    DeviceIoControl path or the macOS diskutil path regresses, because the CI
+    runners have real disks and no mocking is involved.
+    """
+    nodes = list_device_nodes()
+    if not nodes:
+        pytest.skip("no candidate devices on this machine")
+    sizes = [(n, device_size(n)) for n in nodes]
+    known = [(n, s) for n, s in sizes if s]
+    assert known, f"no size could be determined for any of {sizes}"
+    assert all(size > 0 for _, size in known)
+    removable = [is_removable(n) for n in nodes]
+    assert all(r in (True, False, None) for r in removable)
+
+
+def test_mounted_volumes_never_claim_a_guess_for_the_whole_device():
+    for vol in mounted_volumes(only=_REAL_FSTYPES):
+        assert vol["mountpoint"]
+        assert vol["whole"]
+        if vol["looks_like_dp008ex"]:
+            # Only claim a specific device when the path really implies one.
+            assert vol["whole"] != "see the physical drives listed above"
+
+
+def test_parse_mount_output_handles_macos_mount_lines():
+    text = (
+        "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n"
+        "/dev/disk2s1 on /Volumes/DP-008EX (msdos, local, nodev, nosuid, noowners)\n"
+        "map auto_home on /System/Volumes/Data/home (autofs, automounted, nobrowse)\n"
+    )
+    assert parse_mount_output(text) == [
+        ("/dev/disk3s1s1", "/", "apfs"),
+        ("/dev/disk2s1", "/Volumes/DP-008EX", "msdos"),
+    ]
+
+
+def test_parse_mount_output_is_dumb_but_narrow():
+    """The parser reports device mounts verbatim; filtering happens downstream.
+
+    /dev/null really is a devfs mount, so the parser keeps it. What matters is
+    that mounted_volumes() drops it, because /dev/null is neither a whole device
+    nor a partition of one.
+    """
+    text = "tmpfs on /tmp (local)\n/dev/null on /dev/null (devfs)\n"
+    assert parse_mount_output(text) == [("/dev/null", "/dev/null", "devfs")]
+    assert mounted_volumes(path="does-not-exist") == []
+
+
+def test_windows_backends_are_inert_off_windows(monkeypatch):
+    """On a non-Windows host the ctypes paths must return nothing, not raise."""
+    import tascam_dp008ex_sd_audio_extractor.devices as devices
+
+    if os.name == "nt":
+        pytest.skip("this asserts the non-Windows behaviour")
+    assert devices._win_physical_drives() == []
+    assert devices._win_removable_drives() == []
+    assert devices._win_device_info(r"\\.\PhysicalDrive0") == (None, None)
+
+
+def test_macos_backend_is_inert_off_macos():
+    import sys
+
+    import tascam_dp008ex_sd_audio_extractor.devices as devices
+
+    if sys.platform == "darwin":
+        pytest.skip("this asserts the non-macOS behaviour")
+    assert devices._darwin_disk_info("/dev/disk2") == (None, None)
+
+
+# --- partition-table shape --------------------------------------------
+
+
+def _mbr(entries):
+    return {
+        "total_bytes": 1 << 30,
+        "total_sectors": (1 << 30) // 512,
+        "sig_ok": True,
+        "sig": "55aa",
+        "entries": entries,
+    }
+
+
+def _entry(index, ptype, lba, count):
+    return {
+        "index": index,
+        "boot": 0,
+        "type": ptype,
+        "lba_start": lba,
+        "sector_count": count,
+    }
+
+
+def test_single_partition_card_raises_no_warning():
+    mbr = _mbr(
+        [
+            _entry(0, 0x0B, 63, 4_192_902),
+            _entry(1, 0, 0, 0),
+            _entry(2, 0, 0, 0),
+            _entry(3, 0, 0, 0),
+        ]
+    )
+    assert extra_partition_warning(mbr) is None
+    assert len(nonempty_partitions(mbr)) == 1
+
+
+def test_extra_partitions_are_warned_about_not_silently_ignored():
+    mbr = _mbr(
+        [
+            _entry(0, 0x0B, 63, 4_192_902),
+            _entry(1, 0x83, 4_200_000, 1000),
+            _entry(2, 0, 0, 0),
+            _entry(3, 0, 0, 0),
+        ]
+    )
+    warn = extra_partition_warning(mbr)
+    assert warn is not None
+    assert "2 partitions" in warn
+    assert "type 0x83" in warn
+    assert "would be missed" in warn
+    # mtr_bounds still only consults entry 0, which is the documented behaviour.
+    assert mtr_bounds(mbr)[0] == (63 + 4_192_902) * 512
+
+
+def test_zero_type_but_nonzero_length_counts_as_declared():
+    """Some firmware writes type 0x00 with a real length; that still shadows audio."""
+    mbr = _mbr(
+        [
+            _entry(0, 0x0B, 63, 100),
+            _entry(1, 0x00, 200, 50),
+            _entry(2, 0, 0, 0),
+            _entry(3, 0, 0, 0),
+        ]
+    )
+    assert extra_partition_warning(mbr) is not None

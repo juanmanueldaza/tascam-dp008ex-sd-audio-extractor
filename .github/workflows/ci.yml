@@ -11,6 +11,11 @@ permissions:
   pull-requests: read
   checks: write
 
+# One run per ref: stacked pushes otherwise pile up in the runner queue.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     strategy:
@@ -18,6 +23,16 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.10", "3.12", "3.14"]
+        exclude:
+          # GitHub's hosted macOS pool is oversubscribed: three queued macOS legs
+          # sat for hours while the Linux and Windows legs finished in under a
+          # minute. One macOS leg still exercises the darwin-only code (diskutil,
+          # `mount`, /dev/rdisk* globs) for real at runtime; language-version
+          # coverage is carried by the other two operating systems.
+          - os: macos-latest
+            python-version: "3.10"
+          - os: macos-latest
+            python-version: "3.14"
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -46,6 +61,12 @@ jobs:
 
       - name: Smoke test the installed CLI
         run: tascam-dp008ex-sd-audio-extractor --help
+
+      - name: Real device discovery on this platform
+        # Exercises the platform backends for real, not just the pure parsers:
+        # sysfs on Linux, diskutil + `mount` on macOS, CreateFileW/DeviceIoControl
+        # on Windows. Output is in the job log.
+        run: tascam-dp008ex-sd-audio-extractor devices
 
   build:
     runs-on: ubuntu-latest

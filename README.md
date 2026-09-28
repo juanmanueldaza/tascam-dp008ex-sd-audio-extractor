@@ -95,8 +95,10 @@ sudo tascam-dp008ex-sd-audio-extractor stems /dev/mmcblk0 --out-dir ~/out
   card, and the card never needs to be mounted.
 
 On macOS use the whole disk (`/dev/rdisk2`, faster than `/dev/disk2`); on
-Windows use `\\.\PhysicalDriveN`. Both are recognised, and `devices` reports
-what it can see — including an honest "unreadable (needs root or the disk group)".
+Windows use `\\.\PhysicalDriveN`. Both are recognised. `devices` reports what it
+can see — including an honest "unreadable (needs root or the disk group)" — and
+the table above is explicit about which platform has been tested against real
+hardware.
 
 `list` prints: MBR + MTR bounds, header checks (magic, self-ptr, mtr-start, bitmap),
 BFS ROOT hits, song slots (`Sxxx/SONGxxx`, 250 slots on empty card), alloc-table
@@ -126,6 +128,37 @@ flag histogram + master/inode/extent counts.
 - Song slots @MTR+~35.7MB (`0x1000D9428`), stride 0x24, 250 entries
 - Alloc @MTR+0x288000 (1MiB, 16384×64B): pool `0x80040003/0x80104900` ×256,
   no `0x80030000` masters / `0x9001000x` inodes on empty card
+
+## Platform support — and what is actually verified
+
+Being straight about the evidence, because "works on Linux, macOS and Windows" is
+a claim that deserves receipts:
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Read a real card or image | **verified on hardware** | verified in CI | verified in CI |
+| `devices` discovery | sysfs (size/removable) | `/dev/disk*` + `diskutil` | `\\.\PhysicalDriveN` via `CreateFileW`/`DeviceIoControl` |
+| Mounted-card warning | `/proc/self/mounts` | `mount` output | removable drive letters |
+| Tested on | a 4GB Tascam DP-008EX card | CI runner | CI runner |
+| Python versions exercised | 3.10, 3.12, 3.14 | 3.12 | 3.10, 3.12, 3.14 |
+
+- **Linux** is the only platform with real hardware behind it. Everything below was
+  read from an actual card (`/dev/mmcblk0`), and `stems /dev/mmcblk0` produces
+  output byte-identical to rendering the same card from an image.
+- **macOS** runs its own code path in CI (`diskutil info -plist` for size and
+  removable state, `mount` for volumes, `/dev/rdisk*` for the raw node) but has not
+  been tested against a physical DP-008EX. Only 3.12 is exercised there: GitHub's
+  hosted macOS pool queues for hours, and one leg that runs beats three that sit
+  pending. Use `/dev/rdisk2`, not `/dev/disk2` — the raw node skips the disk-arbiter
+  cache and is several times faster.
+- **Windows** likewise runs for real in CI, where the runner's own
+  `\\.\PhysicalDrive0` is opened and queried. A removable drive letter is reported,
+  but it is *not* mapped to a physical drive: that needs a device-stack walk, and
+  guessing would be worse than saying so. Use `\\.\PhysicalDrive0`, not `E:\` —
+  `E:\` is a partition and is refused.
+- **Multi-partition cards** are warned about, not silently mis-parsed: only
+  partition 0 is used to locate the MTR, so `verify`/`list` warn if a card declares
+  more than one. A real DP-008EX always has exactly one.
 
 ## Extract (card2, 2026-09-26) — songs recovered
 
@@ -177,6 +210,11 @@ python3 -m pytest tests/
 
 Synthetic-data unit tests (no image needed) for extent parsing, chain walking,
 and both renderers (full-cluster concat, stem boff×2 paste at FRAG=0x8000).
+
+Platform discovery is tested *per platform* rather than mocked: CI runs the
+`devices` command on every runner, so the sysfs, `diskutil` and
+`CreateFileW`/`DeviceIoControl` branches are all executed against real disks
+instead of only being type-checked.
 
 ## License
 
