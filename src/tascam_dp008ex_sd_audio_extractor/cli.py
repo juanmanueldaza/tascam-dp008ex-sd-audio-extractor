@@ -23,6 +23,7 @@ from .devices import (
     device_size,
     is_removable,
     list_device_nodes,
+    mounted_volumes,
 )
 from .extract import (
     HALF,
@@ -71,6 +72,7 @@ def banner(path):
 def cmd_devices(probe=True):
     """List candidate whole devices and, when readable, what audio they hold."""
     nodes = list_device_nodes()
+    volumes = mounted_volumes(only={"vfat", "exfat", "msdos", "ntfs", "ntfs3"})
     if not nodes:
         if os.name == "nt":
             print(r"no candidate block devices found (looked for \\.\PhysicalDriveN)")
@@ -107,6 +109,19 @@ def cmd_devices(probe=True):
                 except (OSError, ValueError) as e:
                     contents = f"unreadable ({type(e).__name__})"
             print(f"{node:22} {human(size):>11}  {rem:9}  {contents}")
+
+    if volumes:
+        print("\nMOUNTED VOLUMES on candidate devices")
+        for vol in volumes:
+            print(f"  {vol['mountpoint']}  ({vol['fstype']}, {vol['partition']})")
+            if vol["looks_like_dp008ex"]:
+                # The songs are not on this filesystem, so the mount looks empty.
+                print(
+                    f"    labelled like a DP-008EX: the songs are on {vol['whole']}, "
+                    "not in this mountpoint"
+                )
+            else:
+                print(f"    not labelled like a DP-008EX (device: {vol['whole']})")
     if probe:
         print(
             "\nA DP-008EX card shows master and stem chains. Other media usually show none."

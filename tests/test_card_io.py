@@ -18,6 +18,8 @@ from tascam_dp008ex_sd_audio_extractor.devices import (
     is_block_device,
     is_partition_node,
     is_whole_device,
+    mounted_volumes,
+    parse_mounts,
     partition_hint,
     whole_device_for,
 )
@@ -244,6 +246,101 @@ def test_cli_image_command(tmp_path, capsys):
 def test_cli_devices_runs_without_raising(capsys):
     assert main(["devices"]) == 0
     assert "Partition nodes" in capsys.readouterr().out
+
+
+def test_parse_mounts_keeps_only_device_mounts():
+    text = (
+        "/dev/mmcblk0p1 /run/media/u/DP-008EX vfat rw,relatime 0 0\n"
+        "/dev/sda1 /boot ext4 rw 0 0\n"
+        "tmpfs /run tmpfs rw 0 0\n"
+        "proc /proc proc rw 0 0\n"
+        "/dev/loop1 /snap/x squashfs ro 0 0\n"
+    )
+    assert parse_mounts(text) == [
+        ("/dev/mmcblk0p1", "/run/media/u/DP-008EX", "vfat"),
+        ("/dev/sda1", "/boot", "ext4"),
+    ]
+
+
+def test_parse_mounts_unescapes_spaces():
+    text = "/dev/sdb1 /run/media/u/My\\040Card vfat rw 0 0\n"
+    assert parse_mounts(text) == [("/dev/sdb1", "/run/media/u/My Card", "vfat")]
+
+
+def test_mounted_volumes_maps_a_partition_to_its_whole_device(tmp_path):
+    mounts = tmp_path / "mounts"
+    mounts.write_text("/dev/mmcblk0p1 /run/media/u/DP-008EX vfat rw 0 0\n")
+    found = mounted_volumes(path=str(mounts), only={"vfat"})
+    assert found == [
+        {
+            "partition": "/dev/mmcblk0p1",
+            "whole": "/dev/mmcblk0",
+            "mountpoint": "/run/media/u/DP-008EX",
+            "fstype": "vfat",
+            "label": "DP-008EX",
+            "looks_like_dp008ex": True,
+        }
+    ]
+
+
+def test_mounted_volumes_ignores_other_filesystems_and_unknown_mounts(tmp_path):
+    mounts = tmp_path / "mounts"
+    mounts.write_text(
+        "/dev/sda2 /home ext4 rw 0 0\n"
+        "tmpfs /run tmpfs rw 0 0\n"
+        "/dev/disk2s1 /data hfs rw 0 0\n"
+    )
+    assert mounted_volumes(path=str(mounts), only={"vfat", "exfat"}) == []
+
+
+def test_mounted_volumes_survives_a_missing_mounts_file(tmp_path):
+    assert mounted_volumes(path=str(tmp_path / "nope")) == []
+
+
+def test_cli_devices_flags_a_mounted_dp008ex_volume(capsys, monkeypatch):
+    from tascam_dp008ex_sd_audio_extractor import cli
+
+    monkeypatch.setattr(
+        cli,
+        "mounted_volumes",
+        lambda **kw: [
+            {
+                "partition": "/dev/mmcblk0p1",
+                "whole": "/dev/mmcblk0",
+                "mountpoint": "/run/media/u/DP-008EX",
+                "fstype": "vfat",
+                "label": "DP-008EX",
+                "looks_like_dp008ex": True,
+            }
+        ],
+    )
+    assert main(["devices"]) == 0
+    out = capsys.readouterr().out
+    assert "MOUNTED VOLUMES on candidate devices" in out
+    assert "labelled like a DP-008EX: the songs are on /dev/mmcblk0" in out
+
+
+def test_cli_devices_does_not_claim_cards_for_unrelated_mounts(capsys, monkeypatch):
+    from tascam_dp008ex_sd_audio_extractor import cli
+
+    monkeypatch.setattr(
+        cli,
+        "mounted_volumes",
+        lambda **kw: [
+            {
+                "partition": "/dev/nvme0n1p1",
+                "whole": "/dev/nvme0n1",
+                "mountpoint": "/boot",
+                "fstype": "vfat",
+                "label": "EFI",
+                "looks_like_dp008ex": False,
+            }
+        ],
+    )
+    assert main(["devices"]) == 0
+    out = capsys.readouterr().out
+    assert "not labelled like a DP-008EX (device: /dev/nvme0n1)" in out
+    assert "the songs are on" not in out
 
 
 def test_cli_refuses_partition_node(tmp_path, capsys):

@@ -77,6 +77,17 @@ sudo tascam-dp008ex-sd-audio-extractor stems /dev/mmcblk0 --out-dir ~/out
 - **Partition nodes are refused.** `/dev/sdb1`, `/dev/disk2s1` and `D:\` exit
   with an error naming the device you should use instead, because imaging one
   produces an empty-looking card and you would never know songs were missing.
+- **A mounted card is called out.** If the desktop has already mounted the card,
+  `devices` lists the mountpoint and says where the songs really are:
+
+  ```text
+  MOUNTED VOLUMES on candidate devices
+    /run/media/you/DP-008EX  (vfat, /dev/mmcblk0p1)
+      labelled like a DP-008EX: the songs are on /dev/mmcblk0, not in this mountpoint
+  ```
+
+  Do not copy WAVs out of that mountpoint, and do not point the tool at it: the
+  `WAVE/` and `BACKUP/` folders there are exports and backups, not the songs.
 - **`image` will not overwrite the card it is reading**, will not write to a
   device node, and will not clobber an existing file without `--overwrite`. An
   interrupted image continues with `--resume`.

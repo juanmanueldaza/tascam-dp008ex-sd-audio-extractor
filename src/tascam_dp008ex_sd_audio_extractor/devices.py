@@ -170,3 +170,52 @@ def list_device_nodes():
         found.update(glob.glob("/dev/disk[0-9]*"))
         found.update(glob.glob("/dev/rdisk[0-9]*"))
     return sorted(p for p in found if is_whole_device(p))
+
+
+def parse_mounts(text):
+    """Parse /proc/mounts (or /proc/self/mounts) into (device, mountpoint, fstype)."""
+    out = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        device, mountpoint, fstype = parts[0], parts[1], parts[2]
+        if device.startswith("/dev/") and not device.startswith("/dev/loop"):
+            out.append((device, mountpoint.replace("\\040", " "), fstype.lower()))
+    return out
+
+
+def mounted_volumes(path="/proc/self/mounts", only=None):
+    """Mounted volumes that sit on a candidate device.
+
+    A mounted DP-008EX card looks empty, which is the trap: the songs are not on
+    the filesystem. This surfaces the mount and the whole device that actually
+    holds them. `only` filters by filesystem type (e.g. {"vfat", "exfat"}).
+    """
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        return []
+    found = []
+    for device, mountpoint, fstype in parse_mounts(text):
+        if only and fstype not in only:
+            continue
+        whole = whole_device_for(device) or (
+            device if is_whole_device(device) else None
+        )
+        if whole is None:
+            continue
+        label = os.path.basename(mountpoint.rstrip("/")) or mountpoint
+        found.append(
+            {
+                "partition": device,
+                "whole": whole,
+                "mountpoint": mountpoint,
+                "fstype": fstype,
+                "label": label,
+                "looks_like_dp008ex": "dp-008" in label.lower()
+                or "dp008" in label.lower(),
+            }
+        )
+    return found
