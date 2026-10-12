@@ -1,0 +1,21 @@
+total: 10092032 bytes (0.010 GB, 19711 sectors) sig_ok=True
+p0: type=0x0b lba=63 count=64 bytes=32768
+p1: type=0x00 lba=0 count=0 bytes=0
+p2: type=0x00 lba=0 count=0 bytes=0
+p3: type=0x00 lba=0 count=0 bytes=0
+MTR_BASE=65024 (0xfe00) sector=127 size=0.010 GB
+header magic=0x38974989 sector_size=512 reserved=192s/98304B
+self_ptr=0x00000083 (hdr sector 131) match=True
+mtr_start_ptr=0x0000007f (mtr sector 127) match=True
+bitmap_ptr=0x00000089 expect_mtr+10=0x00000089 match=True
+bfs_root_ptr_cand(+0x68)=0x0000008f backup_root_cand(+0x74)=0x00000000
+bfs_ptr_probe @sector 143: 42465320524f4f54000000000000000000000000000000000000000000000000... BFS ROOT in sector: True
+BFS ROOT hits: 1
+  0x11e00 sector=143 sec_off=0
+song slots found: 1
+  0x12e00 S001/SONG001
+alloc: 16384 records; masters=2 inodes=1 ext5=0 ext6=4
+  flag 0x80030001: 2
+  flag 0x90000006: 1
+  flag 0x90010001: 1
+  flag 0x90010006: 4

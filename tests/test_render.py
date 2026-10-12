@@ -129,8 +129,9 @@ def test_render_chain_full_concat_sorted_by_boff():
     f.write(c2)
     f.seek(0)
     pairs = [(2, 0x200), (1, 0x100)]  # unsorted by boff
-    out = render_chain(f, base, end, pairs)
-    assert out == c1 + c2  # boff order, whole clusters
+    res = render_chain(f, base, end, pairs)
+    assert res.pcm == c1 + c2  # boff order, whole clusters
+    assert res.skips == ()
 
 
 def test_render_chain_skips_out_of_range():
@@ -141,8 +142,9 @@ def test_render_chain_skips_out_of_range():
     f.seek(base + 1 * SECTOR_BYTES)
     f.write(c1)
     f.seek(0)
-    out = render_chain(f, base, end, [(1, 0x100), (9, 0x300)])
-    assert out == c1
+    res = render_chain(f, base, end, [(1, 0x100), (9, 0x300)])
+    assert res.pcm == c1
+    assert [s.site for s in res.skips] == ["E3"]
 
 
 def test_render_chain_respects_max_bytes():
@@ -158,8 +160,12 @@ def test_render_chain_respects_max_bytes():
     f.write(c2)
     f.seek(0)
     pairs = [(1, 0x100), (2, 0x200)]
-    assert render_chain(f, base, end, pairs, max_bytes=SECTOR_BYTES) == c1
-    assert render_chain(f, base, end, pairs, max_bytes=3 * SECTOR_BYTES) == c1 + c2
+    res = render_chain(f, base, end, pairs, max_bytes=SECTOR_BYTES)
+    assert res.pcm == c1
+    assert [s.site for s in res.skips] == ["E2"]
+    res = render_chain(f, base, end, pairs, max_bytes=3 * SECTOR_BYTES)
+    assert res.pcm == c1 + c2
+    assert res.skips == ()
 
 
 # --- stem renderer ---------------------------------------------------------
@@ -195,25 +201,28 @@ def stem_image(pairs=STEM_PAIRS, end=None):
 
 def test_render_stem_paste_at_boff_times_two():
     f, chain, end = stem_image()
-    out, cov = render_stem(f, 0, end, chain)
+    res = render_stem(f, 0, end, chain)
     # timeline = (max_boff + FRAG_SAMPLES) samples of mono 16-bit
-    assert len(out) == (0x1A4000 + FRAG_SAMPLES) * 2
+    assert len(res.pcm) == (0x1A4000 + FRAG_SAMPLES) * 2
     # fragment pasted at byte offset boff*2, exactly FRAG bytes
     p = 0x3C000 * 2
-    assert out[p : p + FRAG] == bytes([0x10]) * FRAG
+    assert res.pcm[p : p + FRAG] == bytes([0x10]) * FRAG
     # zeros until the next fragment (catches FRAG over-read AND byte/sample mixup)
     p2 = 0x84000 * 2
-    assert out[p + FRAG : p2] == bytes(p2 - p - FRAG)
+    assert res.pcm[p + FRAG : p2] == bytes(p2 - p - FRAG)
+    assert res.skips == ()
 
 
 def test_render_stem_gap_and_coverage():
     f, chain, end = stem_image()
-    out, cov = render_stem(f, 0, end, chain)
+    res = render_stem(f, 0, end, chain)
     p1 = 0x3C000 * 2
     p2 = 0x84000 * 2
-    assert out[p1 + FRAG : p2] == b"\x00" * (p2 - p1 - FRAG)
+    assert res.pcm[p1 + FRAG : p2] == b"\x00" * (p2 - p1 - FRAG)
     # 6 fragments x FRAG/4096 nonzero blocks over the whole timeline
-    assert cov == (6 * (FRAG // 4096)) / ((0x1A4000 + FRAG_SAMPLES) * 2 // 4096)
+    assert res.coverage == (6 * (FRAG // 4096)) / (
+        (0x1A4000 + FRAG_SAMPLES) * 2 // 4096
+    )
 
 
 def test_render_stem_skips_extent_past_end():
@@ -222,18 +231,20 @@ def test_render_stem_skips_extent_past_end():
     past = (end // RAW_SECTOR) + 8
     pairs = [*STEM_PAIRS[:5], (past, 0x1A4000)]
     f, chain, end = stem_image(pairs=pairs, end=end)
-    out, _ = render_stem(f, 0, end, chain)
+    res = render_stem(f, 0, end, chain)
     last = 0x1A4000 * 2
-    assert out[last : last + FRAG] == bytes(FRAG)  # skipped => zeros
+    assert res.pcm[last : last + FRAG] == bytes(FRAG)  # skipped => zeros
+    assert [s.site for s in res.skips] == ["S2"]
 
 
 def test_render_stem_clamps_corrupt_boff():
     """A wild boff must not request a huge allocation; clamp to the card span."""
     pairs = [(8, 0x7FFF0000)]
     f, chain, end = stem_image(pairs=pairs, end=1 << 20)
-    out, cov = render_stem(f, 0, end, chain)
-    assert len(out) == end  # clamped to card span, not boff
-    assert cov == 0.0  # fragment offset lands outside the timeline => skipped
+    res = render_stem(f, 0, end, chain)
+    assert len(res.pcm) == end  # clamped to card span, not boff
+    assert res.coverage == 0.0  # fragment offset lands outside the timeline
+    assert [s.site for s in res.skips] == ["S4"]
 
 
 # --- robustness ------------------------------------------------------------
@@ -273,7 +284,7 @@ def test_pcm_stats():
 def test_write_wav_roundtrip(tmp_path):
     pcm = struct.pack("<4h", 0, 1, -1, 32767)
     p = str(tmp_path / "t.wav")
-    write_wav(p, pcm)
+    assert write_wav(p, pcm) == ()
     with wave.open(p) as w:
         assert (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (1, 2, 44100)
         assert w.readframes(4) == pcm

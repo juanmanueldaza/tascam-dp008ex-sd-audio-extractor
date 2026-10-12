@@ -37,14 +37,15 @@ pip install .
 tascam-dp008ex-sd-audio-extractor devices                    # what cards are attached?
 tascam-dp008ex-sd-audio-extractor image /dev/sdb -o card.img # card -> image, verified
 tascam-dp008ex-sd-audio-extractor list card.img              # MBR/MTR/BFS/songs/masters
-tascam-dp008ex-sd-audio-extractor extract-all card.img       # master chains -> mono WAVs
-tascam-dp008ex-sd-audio-extractor stems card.img             # stem timelines -> WAVs
+tascam-dp008ex-sd-audio-extractor extract-all card.img       # master pairs -> stereo WAVs
+tascam-dp008ex-sd-audio-extractor stems card.img             # stem timelines -> mono WAVs
 tascam-dp008ex-sd-audio-extractor verify card.img            # cross-check model (exit 0 = PASS)
+tascam-dp008ex-sd-audio-extractor songs card.img --start 0x3000  # slot table (report-only)
 ```
 
 Also runnable as `python3 -m tascam_dp008ex_sd_audio_extractor ...`. Every read
-command (`list`, `carve`, `extract-all`, `stems`, `verify`) accepts **either** a
-whole block device **or** an image file.
+command (`list`, `carve`, `extract-all`, `stems`, `verify`, `songs`) accepts
+**either** a whole block device **or** an image file.
 
 ## Working with SD cards directly
 
@@ -106,17 +107,83 @@ flag histogram + master/inode/extent counts.
 
 ## What the commands do
 
-- **extract-all** — walks the master extent chains (`0x90010006`, even/odd
-  cluster stereo interleave) and concatenates each chain in boff order into a
-  WAV. Pairs share identical boff spans = one stereo song each.
+- **extract-all** — walks the master extent chains (`0x90010006`, full-cluster
+  concat in boff order) and groups them by identical boff span: each pair is
+  one stereo song and ships as ONE interleaved stereo WAV (previously two
+  mono files — breaking change, see card2 counts below). Pairing signal is
+  proven (identical spans); **L/R assignment is conventional, not proven**
+  (lowest head A-offset = L) — see `docs/taxonomy.md`. A chain with no
+  partner renders mono plus an `unpaired` skip (strict failure).
 - **stems** — the second extent family (`0x90000006`/`0x90000005`, raw 512B
   sector addressing) rendered as 44.1kHz mono timelines with each 16,384-sample
-  fragment pasted at its boff. Sparse punch-in timelines (coverage ~1/18);
-  import all stems of a song starting at 0 in your DAW.
+  fragment pasted at its boff. Always mono per chain, never interleaved:
+  temporally-aligned stem pairs are ambiguous (true stereo vs simultaneous
+  mono takes) and mono-pair preserves everything — see `docs/taxonomy.md`.
+  Sparse punch-in timelines (coverage ~1/18); import all stems of a song
+  starting at 0 in your DAW. (`0x90010005` first-extents are a DP-03-only
+  HYPOTHESIS — absent from DP-008EX images; counted, never rendered.)
 - **verify** — image-only cross-check of the render model: size-field pairing,
   master boundary smoothness (full vs half-cluster model), duplicate-block
   scan, stem durations vs song size fields, fragment packing adjacency,
-  sparse-coverage sanity. Exit code 0 = PASS.
+  sparse-coverage sanity. Exit code 0 = PASS. Note: the boundary-smoothness
+  metric does not apply to impulse-train test signals (deliberate
+  discontinuities); sample-exactness there is proven by the A1 fidelity
+  harness instead (`tests/test_fidelity.py`).
+- **carve** — sweeps pool clusters for PCM-structured audio (survey tool).
+- **songs** — report-only table of the 0x24-stride song-slot records
+  (`--start` gives the MTR-relative array start, required): per-slot index,
+  `Sxxx`/`SONGxxx` strings, and raw hex for all 36 bytes. Intra-record
+  layout and chain linkage are unproven HYPOTHESES
+  (`docs/song-slot-hypothesis.md`); output never renames or routes WAVs.
+
+## Strict by default (incomplete reads fail loudly)
+
+`list`, `carve`, `extract-all`, `stems`, and `verify` exit non-zero when
+any read was incomplete, and print a one-line summary first:
+
+```text
+2 of 3 chains incomplete (2 skips)
+```
+
+Pass `--allow-incomplete` to get exit 0 anyway (skips are still reported).
+Every drop, truncate, cap, out-of-range, short-read, odd-byte, omission,
+and unpaired-chain event emits a named, counted `Skip` — there is no
+silent data loss. Full per-site trigger tests: `tests/test_skip_reporting.py`;
+audit table in its module docstring.
+
+| site | where | kind | when |
+|---|---|---|---|
+| E1 | render_chain | short-read | short sector read (truncated image) |
+| E2 | render_chain | cap | 12h render cap hit (corrupt alloc repeats sectors) |
+| E3 | render_chain | oob | nonzero sector outside span (corrupt) |
+| E4 | render_chain | truncation | output cut to render cap |
+| S1 | render_stem | oob | raw sector 0 with nonzero boff (corrupt) |
+| S2 | render_stem | oob | fragment outside span (corrupt) |
+| S3 | render_stem | short-read | short fragment read (truncated) |
+| S4 | render_stem | oob | boff outside timeline (corrupt boff, clamped) |
+| S5 | render_stem | truncation | fragment crosses timeline end |
+| C1 | carve sweep | short-read | short cluster read (truncated) |
+| SC1 | BFS scan | cap | more than 16 `BFS ROOT` hits |
+| SC4 | slot scan | cap | more than 400 slot matches |
+| CL1 / CL3 | verify re-reads | short-read | short master/stem re-read (truncated) |
+| CL2 | verify | omission | no size fields, durations unchecked |
+| W1 | write_wav | odd-byte | trailing odd byte dropped (WAV needs whole samples) |
+| A4 | extract-all | unpaired | lone master chain → mono fallback |
+| SC3 | slot scan | — | FIXED by the 14-byte chunk overlap (A3) |
+| SC2 | slot scan | — | subsumed: same 400-cap event as SC4, one skip |
+| W2 | pcm_stats mask | — | documented display-sampling (kept: `iter_unpack` raises on odd input) |
+| — | `(0,0)` padding slots | — | structural filler, silent by design (pristine cards stay exit 0) |
+
+## Benchmark (B0 baseline for efficiency work)
+
+`bench/bench.py` (dev-only, never shipped) times `extract-all`, `stems`,
+`carve --limit 200`, and `verify` on a 4 GiB sparse synthetic image
+(`bench/gen_image.py`, seeded, streaming cluster-by-cluster build) and
+records wall time, peak RSS, and stdlib read/seek counts. Counts are a
+**proxy** — tallies on the buffered file object, not literal syscalls —
+and RSS is the per-command process peak (forked child on POSIX).
+Methodology plus the committed baseline numbers live in `BENCHMARK.md`;
+reproduce with `python bench/bench.py --rebuild`.
 
 ## Layout learned (2026-09-26, 31GB image, empty card)
 

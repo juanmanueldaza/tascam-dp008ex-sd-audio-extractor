@@ -16,6 +16,7 @@ Reading and chain walking are shared with the master path
 """
 
 from .extract import MAX_PCM_BYTES, extent_pairs
+from .report import Kind, RenderResult, Skip
 
 RAW_SECTOR = 512
 FRAG = 64 * RAW_SECTOR  # 0x8000 bytes = 16,384 samples per extent
@@ -26,9 +27,10 @@ STEM_FLAGS = (0x90000006, 0x90000005)
 def render_stem(f, mtr_base, mtr_end, chain):
     """Paste chain fragments at boff*2 on a silent timeline.
 
-    Returns (pcm, coverage_frac). boff is in samples; timeline length =
-    (max_boff + FRAG_SAMPLES) samples of mono 16-bit, clamped to the card span
-    and MAX_PCM_BYTES so a corrupt boff cannot request a huge allocation.
+    Returns RenderResult (pcm, skips, coverage_frac). boff is in samples;
+    timeline length = (max_boff + FRAG_SAMPLES) samples of mono 16-bit,
+    clamped to the card span and MAX_PCM_BYTES so a corrupt boff cannot
+    request a huge allocation. Every loss emits a Skip (S1-S5), never silent.
     """
     frags = []
     for r in chain:
@@ -39,17 +41,69 @@ def render_stem(f, mtr_base, mtr_end, chain):
         MAX_PCM_BYTES // 2,
     )
     out = bytearray(top * 2)
+    skips = []
     for sector, boff in frags:
-        if sector == 0:  # zero padding slot; raw sector 0 is the MTR header
+        # (0, 0) slots are structural padding, not loss: skip silently
+        # (pristine renders stay skip-free; AC-4). A nonzero boff pointing
+        # at raw sector 0 (the MTR header, never audio) is genuinely OOB.
+        if sector == 0 and boff == 0:
+            continue
+        if sector == 0:
+            skips.append(
+                Skip(
+                    site="S1",
+                    kind=Kind.OOB,
+                    detail=(
+                        f"raw sector 0 with boff {boff:#x} (MTR header, never audio)"
+                    ),
+                )
+            )
             continue
         o = mtr_base + sector * RAW_SECTOR
         if o < mtr_base or o + FRAG > mtr_end:
+            skips.append(
+                Skip(
+                    site="S2",
+                    kind=Kind.OOB,
+                    detail=f"raw sector {sector} outside audio span",
+                )
+            )
             continue
         f.seek(o)
         d = f.read(FRAG)
+        if len(d) < FRAG:
+            skips.append(
+                Skip(
+                    site="S3",
+                    kind=Kind.SHORT_READ,
+                    detail=(f"raw sector {sector}: got {len(d)} of {FRAG} bytes"),
+                )
+            )
         p = boff * 2
         if p < 0 or p >= len(out):
+            skips.append(
+                Skip(
+                    site="S4",
+                    kind=Kind.OOB,
+                    detail=f"boff {boff:#x} lands outside the timeline",
+                )
+            )
             continue
+        if p + len(d) > len(out):
+            skips.append(
+                Skip(
+                    site="S5",
+                    kind=Kind.TRUNCATION,
+                    detail=(
+                        f"boff {boff:#x}: fragment crosses timeline end, "
+                        f"kept {len(out) - p} of {len(d)} bytes"
+                    ),
+                )
+            )
         out[p : p + len(d)] = d[: len(out) - p]
     nz = sum(1 for i in range(0, len(out), 4096) if any(out[i : i + 4096]))
-    return bytes(out), nz / max(1, (len(out) + 4095) // 4096)
+    return RenderResult(
+        pcm=bytes(out),
+        skips=tuple(skips),
+        coverage=nz / max(1, (len(out) + 4095) // 4096),
+    )

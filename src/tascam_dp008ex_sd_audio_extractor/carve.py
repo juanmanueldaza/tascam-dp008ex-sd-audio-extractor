@@ -3,6 +3,8 @@
 import math
 import struct
 
+from .report import Kind, Skip
+
 CLUSTER = 0x18000  # 96 KiB, from MTR header reserved field
 POOL_OFF = 0x390000  # audio pool start relative to MTR_BASE (DP-03 confirmed)
 
@@ -42,8 +44,13 @@ def cluster_stats(raw):
     }
 
 
-def sweep(f, mtr_base, mtr_end, stride=16, limit=0):
-    """Yield (idx, abs_off, stats) for every stride-th cluster. limit caps count (0=all)."""
+def sweep(f, mtr_base, mtr_end, stride=16, limit=0, skips=None):
+    """Yield (idx, abs_off, stats) for every stride-th cluster. limit caps count (0=all).
+
+    A short final read (truncated image) ends the sweep and, when skips is
+    given, records a C1 short-read Skip. The user-requested limit break is
+    not loss and emits nothing.
+    """
     pool_start = mtr_base + POOL_OFF
     total_clusters = (mtr_end - pool_start) // CLUSTER
     done = 0
@@ -53,6 +60,17 @@ def sweep(f, mtr_base, mtr_end, stride=16, limit=0):
         f.seek(off)
         raw = f.read(CLUSTER)
         if len(raw) < CLUSTER:
+            if skips is not None:
+                skips.append(
+                    Skip(
+                        site="C1",
+                        kind=Kind.SHORT_READ,
+                        detail=(
+                            f"cluster {idx} @ {off:#x}: got {len(raw)} "
+                            f"of {CLUSTER} bytes"
+                        ),
+                    )
+                )
             break
         st = cluster_stats(raw)
         yield idx, off, st

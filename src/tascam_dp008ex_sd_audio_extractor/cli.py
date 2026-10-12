@@ -1,6 +1,6 @@
 """CLI: tascam-dp008ex-sd-audio-extractor.
 
-Commands: devices | image | list | carve | extract-all | stems | verify
+Commands: devices | image | list | carve | extract-all | stems | verify | songs
 
 Every read command accepts either a whole block device (/dev/sdb, /dev/rdisk2)
 or an image file; partition nodes are refused because the DP-008EX keeps the
@@ -8,6 +8,7 @@ multitrack audio outside every partition.
 """
 
 import argparse
+import array
 import collections
 import hashlib
 import os
@@ -38,14 +39,20 @@ from .extract import (
 from .header import parse_header
 from .imaging import image_device
 from .mbr import extra_partition_warning, mtr_bounds, parse_mbr
-from .scan import find_bfs_roots, scan_alloc_table, scan_song_slots
+from .report import Kind, Skip, strict_exit, summarize
+from .scan import (
+    find_bfs_roots,
+    parse_song_slots,
+    scan_alloc_table,
+    scan_song_slots,
+)
 from .stems import FRAG, FRAG_SAMPLES, RAW_SECTOR, STEM_FLAGS, render_stem
 from .wavio import RATE, pcm_stats, write_wav
 
 # song assignment by timeline top (samples): short<=0x9D0000, A<=0x6F00000, else B
 SONG_SHORT_TOP = 0x9D0000
 SONG_A_TOP = 0x6F00000
-READ_COMMANDS = ("list", "carve", "extract-all", "stems", "verify")
+READ_COMMANDS = ("list", "carve", "extract-all", "stems", "verify", "songs")
 
 
 def human(n):
@@ -199,7 +206,8 @@ def _s16(buf, off):
     return struct.unpack_from("<h", buf, off)[0]
 
 
-def cmd_list(img_path):
+def cmd_list(img_path, allow_incomplete=False):
+    skips = []
     with open_device(img_path) as f:
         mbr = parse_mbr(f)
         print(
@@ -237,13 +245,13 @@ def cmd_list(img_path):
         print(
             f"bfs_ptr_probe @sector {hdr['bfs_root_ptr_cand']}: {probe[0:32].hex()}... BFS ROOT in sector: {b'BFS ROOT' in f.read(512 - 128) or b'BFS ROOT' in probe}"
         )
-        roots = find_bfs_roots(f, base)
+        roots = find_bfs_roots(f, base, skips=skips)
         print(f"BFS ROOT hits: {len(roots)}")
         for h in roots[:8]:
             print(
                 f"  {h['abs_hex']} sector={h['abs_sector']} sec_off={h['sector_off']}"
             )
-        slots = scan_song_slots(f, base)
+        slots = scan_song_slots(f, base, skips=skips)
         print(f"song slots found: {len(slots)}")
         for s in slots[:20]:
             print(f"  {s['abs_hex']} S{s['s_idx']}/{s['song']}")
@@ -255,9 +263,19 @@ def cmd_list(img_path):
         )
         for fl, c in sorted(at["histogram"].items()):
             print(f"  flag {fl:#010x}: {c}")
+        if skips:
+            print(summarize(skips, len(roots) + len(slots), "entries"))
+        return strict_exit(skips, allow_incomplete)
 
 
-def cmd_carve(img_path, stride=16, limit=0, dump_top=0, out_dir="carve_out"):
+def cmd_carve(
+    img_path,
+    stride=16,
+    limit=0,
+    dump_top=0,
+    out_dir="carve_out",
+    allow_incomplete=False,
+):
     with open_device(img_path) as f:
         mbr = parse_mbr(f)
         base, end = mtr_bounds(mbr)
@@ -268,7 +286,10 @@ def cmd_carve(img_path, stride=16, limit=0, dump_top=0, out_dir="carve_out"):
         hist = collections.Counter()
         scored = []  # (silent_frac desc, -rms, idx, off, stats)
         n = 0
-        for idx, off, st in sweep(f, base, end, stride=stride, limit=limit):
+        skips = []
+        for idx, off, st in sweep(
+            f, base, end, stride=stride, limit=limit, skips=skips
+        ):
             hist[st["label"]] += 1
             n += 1
             if st["label"] in ("pcm-like", "pcm-possible"):
@@ -289,42 +310,140 @@ def cmd_carve(img_path, stride=16, limit=0, dump_top=0, out_dir="carve_out"):
                 p = os.path.join(
                     out_dir, f"cand_{rank:02d}_c{idx}_{off:#x}_rms{st['rms']}.wav"
                 )
-                write_wav(p, raw)
+                skips.extend(write_wav(p, raw))
                 print(f"  wrote {p}")
+        if skips:
+            print(summarize(skips, n, "clusters"))
+        return strict_exit(skips, allow_incomplete)
 
 
-def cmd_extract_all(img_path, out_dir="out"):
+def _boff_span_key(ch):
+    """Pairing signal: sorted boffs of nonzero-sector pairs (taxonomy.md).
+
+    Padding (0,0) slots are record-splitting artifacts, excluded so chains
+    pair on audio geometry regardless of how records were split.
+    """
+    return tuple(sorted(p[1] for r in ch for p in extent_pairs(r) if p[0] != 0))
+
+
+def group_master_chains(chains):
+    """Split master chains into stereo pairs + singles.
+
+    Deterministic: chains ordered by head A-offset; within an identical
+    span, consecutive chains pair (lowest head A = L, conventional);
+    leftovers stay single. Spans must match exactly (no subset pairing).
+    Returns (pairs, singles) with the caller's chain indices: pairs are
+    (left, right, ci, cj), singles are (ci, chain).
+    """
+    ordered = sorted(enumerate(chains), key=lambda t: t[1][0]["A"])
+    by_span = {}
+    for ci, ch in ordered:
+        by_span.setdefault(_boff_span_key(ch), []).append((ci, ch))
+    pairs, singles = [], []
+    for members in by_span.values():
+        while len(members) >= 2:
+            (ci, chl), (cj, chr_) = members.pop(0), members.pop(0)
+            pairs.append((chl, chr_, ci, cj))
+        singles.extend(members)
+    return pairs, singles
+
+
+def interleave_stereo(left, right):
+    """Interleave two equal-length mono s16le buffers into stereo frames.
+
+    array extended-slice assignment runs at C speed. Callers length-match
+    first; mismatched partners fall back to mono (no silent truncation).
+    """
+    n = len(left) // 2
+    out = array.array("h", [0]) * (2 * n)
+    out[0::2] = array.array("h", left)
+    out[1::2] = array.array("h", right)
+    return out.tobytes()
+
+
+def cmd_extract_all(img_path, out_dir="out", allow_incomplete=False):
     with open_device(img_path) as f:
         mbr = parse_mbr(f)
         base, end = mtr_bounds(mbr)
         recs = read_alloc(f, base)
         chains = collect_chains(recs)
-        print(f"chains={len(chains)}")
-        for ci, ch in enumerate(chains):
-            pairs = [p for r in ch for p in extent_pairs(r)]
-            raw = render_chain(f, base, end, pairs)
+        pairs, singles = group_master_chains(chains)
+        print(f"chains={len(chains)} pairs={len(pairs)} singles={len(singles)}")
+        skips = []
+
+        def _write_mono(ci, ch, res, note=""):
+            raw = res.pcm
             rms, peak = pcm_stats(raw[: 4 * 2**20])
-            boffs = sorted(p[1] for p in pairs)
+            boffs = sorted(p[1] for r in ch for p in extent_pairs(r))
             dur = len(raw) / 2 / RATE
             name = os.path.join(
                 out_dir, f"chain{ci}_{len(ch)}recs_{dur / 60:.1f}min_rms{rms:.0f}.wav"
             )
-            write_wav(name, raw)
+            skips.extend(write_wav(name, raw))
             print(
-                f"chain{ci}: recs={len(ch)} pairs={len(pairs)} boff {boffs[0]:#x}..{boffs[-1]:#x} "
-                f"{len(raw) / 2**20:.1f}MB {dur / 60:.1f}min rms={rms:.0f} peak={peak} -> {name}"
+                f"chain{ci}: recs={len(ch)} pairs={len(boffs)} boff {boffs[0]:#x}..{boffs[-1]:#x} "
+                f"{len(raw) / 2**20:.1f}MB {dur / 60:.1f}min rms={rms:.0f} peak={peak}{note} -> {name}"
             )
 
+        for chl, chr_, ci, cj in pairs:
+            resl = render_chain(f, base, end, [p for r in chl for p in extent_pairs(r)])
+            resr = render_chain(
+                f, base, end, [p for r in chr_ for p in extent_pairs(r)]
+            )
+            skips.extend(resl.skips)
+            skips.extend(resr.skips)
+            if len(resl.pcm) == len(resr.pcm):
+                stereo = interleave_stereo(resl.pcm, resr.pcm)
+                rms, peak = pcm_stats(stereo[: 4 * 2**20])
+                dur = len(resl.pcm) / 2 / RATE
+                name = os.path.join(
+                    out_dir, f"stereo_c{ci}c{cj}_{dur / 60:.1f}min_rms{rms:.0f}.wav"
+                )
+                skips.extend(write_wav(name, stereo, nchannels=2))
+                print(
+                    f"stereo c{ci}+c{cj}: {len(stereo) / 2**20:.1f}MB {dur / 60:.1f}min "
+                    f"rms={rms:.0f} peak={peak} L/R conventional -> {name}"
+                )
+            else:
+                # Lengths diverge only after recorded per-chain loss; keep
+                # both mono (no audio beyond the recorded skips is dropped).
+                print(
+                    f"pair c{ci}+c{cj}: length mismatch "
+                    f"({len(resl.pcm)} vs {len(resr.pcm)}), mono fallback"
+                )
+                _write_mono(ci, chl, resl, note=" (pair length mismatch)")
+                _write_mono(cj, chr_, resr, note=" (pair length mismatch)")
+        for ci, ch in singles:
+            res = render_chain(f, base, end, [p for r in ch for p in extent_pairs(r)])
+            skips.extend(res.skips)
+            skips.append(
+                Skip(
+                    site="A4",
+                    kind=Kind.UNPAIRED,
+                    detail=(
+                        f"chain head A={ch[0]['A']:#x} has no "
+                        "identical-boff-span partner; rendered mono"
+                    ),
+                )
+            )
+            _write_mono(ci, ch, res, note=" (unpaired)")
+        if skips:
+            print(summarize(skips, len(chains), "chains"))
+        return strict_exit(skips, allow_incomplete)
 
-def cmd_stems(img_path, out_dir="stems_out"):
+
+def cmd_stems(img_path, out_dir="stems_out", allow_incomplete=False):
     with open_device(img_path) as f:
         mbr = parse_mbr(f)
         base, end = mtr_bounds(mbr)
         recs = read_alloc(f, base, flags=STEM_FLAGS)
         chains = collect_chains(recs, STEM_FLAGS)
         print(f"stem chains={len(chains)}")
+        skips = []
         for ci, ch in enumerate(sorted(chains, key=len, reverse=True)):
-            raw, cov = render_stem(f, base, end, ch)
+            res = render_stem(f, base, end, ch)
+            raw, cov = res.pcm, res.coverage
+            skips.extend(res.skips)
             rms, peak = pcm_stats(raw[: 2 * 2**20])
             frags = [p for r in ch for p in extent_pairs(r) if p[0]]
             song = song_name(max(b for _, b in frags))
@@ -333,16 +452,37 @@ def cmd_stems(img_path, out_dir="stems_out"):
                 out_dir,
                 f"stem_{song}_c{ci}_{len(ch)}recs_{dur / 60:.1f}min_cov{cov:.2f}_rms{rms:.0f}.wav",
             )
-            write_wav(name, raw)
+            skips.extend(write_wav(name, raw))
             print(
                 f"stem {song} c{ci}: recs={len(ch)} frags={len(frags)} flag={ch[0]['flag']:#x} "
                 f"{len(raw) / 2**20:.1f}MB {dur / 60:.1f}min cov={cov:.2f} rms={rms:.0f} peak={peak} -> {name}"
             )
+        if skips:
+            print(summarize(skips, len(chains), "stem chains"))
+        return strict_exit(skips, allow_incomplete)
 
 
-def cmd_verify(img_path):
+def cmd_songs(img_path, start, n=250, stride=0x24):
+    """Report-only song-slot table (A5). Never links slots to chains.
+
+    start is REQUIRED (MTR-relative): the array locator is a single-card
+    observation with competing readings (docs/song-slot-hypothesis.md).
+    """
+    with open_device(img_path) as f:
+        mbr = parse_mbr(f)
+        base, _ = mtr_bounds(mbr)
+        slots = parse_song_slots(f, base, start, n=n, stride=stride)
+        print(f"song slots: start={start:#x} stride={stride:#x} entries={len(slots)}")
+        for s in slots:
+            tag = f"S{s['s_idx']}/{s['song']}" if s["s_idx"] else "-"
+            print(f"  [{s['index']:03d}] {s['abs_hex']} {tag} {s['raw_hex']}")
+        return 0
+
+
+def cmd_verify(img_path, allow_incomplete=False):
     """Cross-checks the render model against the image. Returns exit code."""
     fails = []
+    skips = []
 
     def check(name, cond, detail=""):
         print(
@@ -391,6 +531,16 @@ def cmd_verify(img_path):
                 f.seek(base + cl * SECTOR_BYTES)
                 data = f.read(SECTOR_BYTES)
                 if len(data) < SECTOR_BYTES:
+                    skips.append(
+                        Skip(
+                            site="CL1",
+                            kind=Kind.SHORT_READ,
+                            detail=(
+                                f"master c{ci} cluster {cl}: got {len(data)} "
+                                f"of {SECTOR_BYTES} bytes"
+                            ),
+                        )
+                    )
                     continue
                 for b in range(0, len(data), 4096):
                     blocks[hashlib.md5(data[b : b + 4096]).hexdigest()] += 1
@@ -437,11 +587,13 @@ def cmd_verify(img_path):
         # --- stems: duration vs size field, dup, coverage, partner adjacency ---
         print(f"stem chains={len(schains)}")
         all_frags = []
+        stem_durs = []
         for ci, ch in enumerate(schains):
             frags = [p for r in ch for p in extent_pairs(r) if p[0]]
             all_frags.append(frags)
             top = max(b for _, b in frags) + FRAG_SAMPLES
             dur = top / RATE
+            stem_durs.append(dur)
             if sizes:
                 near = min(sizes, key=lambda s: abs(s / RATE - dur))
                 ok = abs(near / RATE - dur) / dur < 0.01
@@ -456,6 +608,16 @@ def cmd_verify(img_path):
                 f.seek(base + s * RAW_SECTOR)
                 data = f.read(FRAG)
                 if len(data) < FRAG:
+                    skips.append(
+                        Skip(
+                            site="CL3",
+                            kind=Kind.SHORT_READ,
+                            detail=(
+                                f"stem c{ci} raw sector {s}: got {len(data)} "
+                                f"of {FRAG} bytes"
+                            ),
+                        )
+                    )
                     continue
                 blocks[hashlib.md5(data).hexdigest()] += 1
                 touched.update(range((b * 2) // 4096, (b * 2 + FRAG) // 4096))
@@ -493,8 +655,21 @@ def cmd_verify(img_path):
     warn = extra_partition_warning(mbr)
     if warn:
         print(f"warning: {warn}")
+    if not sizes and (durations or stem_durs):
+        skips.append(
+            Skip(
+                site="CL2",
+                kind=Kind.OMISSION,
+                detail=(
+                    "no size fields; "
+                    f"{len(durations) + len(stem_durs)} duration checks omitted"
+                ),
+            )
+        )
     print(("VERIFY FAIL: " + ", ".join(fails)) if fails else "VERIFY PASS")
-    return 1 if fails else 0
+    if skips:
+        print(summarize(skips, len(chains) + len(schains), "chains"))
+    return max(1 if fails else 0, strict_exit(skips, allow_incomplete))
 
 
 def main(argv=None):
@@ -520,6 +695,21 @@ def main(argv=None):
         "verify", help="cross-check render model against the image (no WAV output)"
     )
     pv.add_argument("image")
+    ps = sub.add_parser(
+        "songs",
+        help="report 0x24-stride song-slot records (report-only, no chain linkage)",
+    )
+    ps.add_argument("image")
+    ps.add_argument(
+        "--start",
+        required=True,
+        type=lambda x: int(x, 0),
+        help="MTR-relative slot-array start (hex, e.g. 0x3000)",
+    )
+    ps.add_argument("--count", type=int, default=250)
+    ps.add_argument(
+        "--stride", type=lambda x: int(x, 0), default=0x24, help="record stride"
+    )
     pd = sub.add_parser(
         "devices", help="list candidate SD/USB devices and what audio they hold"
     )
@@ -537,6 +727,12 @@ def main(argv=None):
     pi.add_argument("--no-verify", action="store_true", help="skip the re-read check")
     pi.add_argument("--resume", action="store_true", help="continue a partial image")
     pi.add_argument("--overwrite", action="store_true", help="replace an existing file")
+    for p in (pl, pc, px, pt, pv):
+        p.add_argument(
+            "--allow-incomplete",
+            action="store_true",
+            help="exit 0 even when reads were incomplete (skips still reported)",
+        )
     a = ap.parse_args(argv)
     try:
         if a.cmd == "devices":
@@ -554,21 +750,28 @@ def main(argv=None):
         if a.cmd in READ_COMMANDS:
             banner(a.image)  # refuses partition nodes
         if a.cmd == "list":
-            cmd_list(a.image)
+            return cmd_list(a.image, allow_incomplete=a.allow_incomplete)
         elif a.cmd == "carve":
-            cmd_carve(
+            return cmd_carve(
                 a.image,
                 stride=a.stride,
                 limit=a.limit,
                 dump_top=a.dump_top,
                 out_dir=a.out_dir,
+                allow_incomplete=a.allow_incomplete,
             )
         elif a.cmd == "extract-all":
-            cmd_extract_all(a.image, out_dir=a.out_dir)
+            return cmd_extract_all(
+                a.image, out_dir=a.out_dir, allow_incomplete=a.allow_incomplete
+            )
         elif a.cmd == "stems":
-            cmd_stems(a.image, out_dir=a.out_dir)
+            return cmd_stems(
+                a.image, out_dir=a.out_dir, allow_incomplete=a.allow_incomplete
+            )
         elif a.cmd == "verify":
-            return cmd_verify(a.image)
+            return cmd_verify(a.image, allow_incomplete=a.allow_incomplete)
+        elif a.cmd == "songs":
+            return cmd_songs(a.image, a.start, n=a.count, stride=a.stride)
     except (OSError, ValueError, MemoryError, PartitionNodeError) as e:
         print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
         return 2

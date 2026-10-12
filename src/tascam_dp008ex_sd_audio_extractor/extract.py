@@ -4,6 +4,7 @@ import struct
 from collections.abc import Iterable
 
 from .carve import CLUSTER
+from .report import Kind, RenderResult, Skip
 
 ALLOC_OFF = 0x288000
 ALLOC_LEN = 1 << 20
@@ -81,17 +82,61 @@ def render_chain(f, mtr_base, mtr_end, pairs, max_bytes=MAX_PCM_BYTES):
     """pairs sorted by file_offset; read whole 0x18000 cluster per sector.
 
     Stops at max_bytes (guard against a corrupt alloc table repeating sectors).
+    Returns RenderResult; every loss emits a Skip (E1-E4), never silent.
     """
     pairs = sorted(pairs, key=lambda p: p[1])
     out = bytearray()
-    for sector, _boff in pairs:
+    skips = []
+    for idx, (sector, boff) in enumerate(pairs):
         if len(out) >= max_bytes:
+            skips.append(
+                Skip(
+                    site="E2",
+                    kind=Kind.CAP,
+                    detail=(
+                        f"hit {max_bytes}-byte render cap; "
+                        f"{len(pairs) - idx} pairs unread"
+                    ),
+                )
+            )
             break
+        # (0, 0) slots are structural padding of the 6-pair extent record,
+        # not audio and not loss: skip silently. AC-4 (e2e exit 0 unchanged)
+        # under strict-default-on requires pristine renders to stay skip-free.
+        if sector == 0 and boff == 0:
+            continue
         abs_off = mtr_base + sector * SECTOR_BYTES
-        # sector 0 is the MTR header cluster, never audio (also catches the
-        # zero-valued padding slots of an extent record)
+        # sector 0 is the MTR header cluster, never audio
         if sector == 0 or abs_off + SECTOR_BYTES > mtr_end or abs_off < mtr_base:
+            skips.append(
+                Skip(
+                    site="E3",
+                    kind=Kind.OOB,
+                    detail=f"sector {sector} outside audio span",
+                )
+            )
             continue
         f.seek(abs_off)
-        out += f.read(SECTOR_BYTES)
-    return bytes(out[:max_bytes])
+        data = f.read(SECTOR_BYTES)
+        if len(data) < SECTOR_BYTES:
+            skips.append(
+                Skip(
+                    site="E1",
+                    kind=Kind.SHORT_READ,
+                    detail=(
+                        f"sector {sector}: got {len(data)} of {SECTOR_BYTES} bytes"
+                    ),
+                )
+            )
+        out += data
+    pcm = bytes(out)
+    if len(pcm) > max_bytes:
+        skips.append(
+            Skip(
+                site="E4",
+                kind=Kind.TRUNCATION,
+                detail=f"cut {len(pcm)} bytes to {max_bytes}-byte render cap",
+            )
+        )
+        pcm = pcm[:max_bytes]
+    return RenderResult(pcm=pcm, skips=tuple(skips))
