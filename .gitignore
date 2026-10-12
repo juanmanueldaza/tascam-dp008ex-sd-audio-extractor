@@ -19,3 +19,13 @@ out/
 stems_out/
 *.img
 *.wav
+
+# N3RV — NEVER COMMIT (template-controlled)
+.n3rv/
+.opencode/
+.githooks/
+.specify/
+AGENTS.md
+constitution.md
+opencode.json
+opencode.template.json
