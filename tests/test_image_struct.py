@@ -18,7 +18,12 @@ from tascam_dp008ex_sd_audio_extractor.header import (
     HEADER_OFF,
     parse_header,
 )
-from tascam_dp008ex_sd_audio_extractor.mbr import SECTOR, mtr_bounds, parse_mbr
+from tascam_dp008ex_sd_audio_extractor.mbr import (
+    SECTOR,
+    fat_bounds,
+    mtr_bounds,
+    parse_mbr,
+)
 from tascam_dp008ex_sd_audio_extractor.scan import (
     find_bfs_roots,
     scan_alloc_table,
@@ -65,6 +70,12 @@ def test_mtr_bounds_starts_after_partition():
     base, end = mtr_bounds(mbr)
     assert base == (63 + 1000) * SECTOR
     assert end == mbr["total_bytes"]
+
+
+def test_fat_bounds_covers_partition_zero():
+    mbr = parse_mbr(make_image(part_lba=63, part_count=1000))
+    base, end = fat_bounds(mbr)
+    assert (base, end) == (63 * SECTOR, (63 + 1000) * SECTOR)
 
 
 # --- header ----------------------------------------------------------------

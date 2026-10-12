@@ -53,6 +53,13 @@ def mtr_bounds(mbr):
     return base, mbr["total_bytes"]
 
 
+def fat_bounds(mbr):
+    """Partition 0 byte range (the FAT32 volume). Sibling to mtr_bounds."""
+    p0 = mbr["entries"][0]
+    base = p0["lba_start"] * SECTOR
+    return base, base + p0["sector_count"] * SECTOR
+
+
 def extra_partition_warning(mbr):
     """Warn when the layout is not the single-partition shape a DP-008EX uses.
 

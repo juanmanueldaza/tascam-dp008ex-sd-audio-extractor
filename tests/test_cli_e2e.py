@@ -12,16 +12,23 @@ import wave
 import pytest
 from helpers import (
     ALLOC_OFF,
+    FAT_PART_SECTORS,
+    FAT_PAYLOAD,
     MASTER_SAMPLES,
     MTR_BASE,
+    POOL_CLUSTER0,
     STEM_BOFFS,
     STEM_SAMPLES,
     build_image,
+    build_image_fat,
     image_bytes,
+    image_bytes_fat,
     ramp_value,
 )
 from test_render import make_rec
 
+from tascam_dp008ex_sd_audio_extractor import cli as cli_mod
+from tascam_dp008ex_sd_audio_extractor.carve import CLUSTER
 from tascam_dp008ex_sd_audio_extractor.cli import (
     group_master_chains,
     interleave_stereo,
@@ -181,6 +188,23 @@ def test_cli_is_importable_as_module():
     assert "tascam-dp008ex-sd-audio-extractor" in r.stdout
 
 
+def test_devices_reports_fat_exports(tmp_path, capsys, monkeypatch):
+    """AC-13: probe appends export count; foreign cards stay silent."""
+    p = build_image_fat(tmp_path / "fat.img")
+    monkeypatch.setattr(cli_mod, "list_device_nodes", lambda: [str(p)])
+    monkeypatch.setattr(cli_mod, "can_read", lambda node: True)
+    monkeypatch.setattr(cli_mod, "device_size", lambda node: 1 << 20)
+    monkeypatch.setattr(cli_mod, "is_removable", lambda node: True)
+    monkeypatch.setattr(cli_mod, "mounted_volumes", lambda only=None: [])
+    assert main(["devices"]) == 0
+    assert ", 1 FAT export(s)" in capsys.readouterr().out
+
+    q = build_image(tmp_path / "plain.img")
+    monkeypatch.setattr(cli_mod, "list_device_nodes", lambda: [str(q)])
+    assert main(["devices"]) == 0
+    assert "FAT export(s)" not in capsys.readouterr().out
+
+
 def test_songs_reports_250_slots(tmp_path, capsys):
     """AC-18: report-only 0x24-stride table, one entry per slot + raw hex."""
     img = bytearray(image_bytes())
@@ -195,3 +219,40 @@ def test_songs_reports_250_slots(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "entries=250" in out
     assert "S000/SONG000" in out and "S249/SONG249" in out
+
+
+def test_extract_all_harvests_fat_exports(tmp_path, capsys):
+    """AC-2/AC-14: clean FAT image yields stereo WAV + verbatim exports."""
+    p = build_image_fat(tmp_path / "fat.img")
+    d = tmp_path / "m"
+    assert main(["extract-all", str(p), "--out-dir", str(d)]) == 0
+    assert "incomplete" not in capsys.readouterr().out
+    names = sorted(x.name for x in d.iterdir())
+    assert "MILPED01.WAV" in names and "DATA.BIN" in names
+    assert any(n.startswith("stereo_") for n in names)  # MTR pair rendered too
+    assert (d / "MILPED01.WAV").read_bytes() == FAT_PAYLOAD
+
+
+def test_extract_all_copy_skip_strict(tmp_path, capsys):
+    """AC-15: corrupt FAT chain fails strict with a files summary only."""
+    p = build_image_fat(tmp_path / "fatloop.img", variant="loop")
+    d = tmp_path / "m"
+    assert main(["extract-all", str(p), "--out-dir", str(d)]) == 1
+    out = capsys.readouterr().out
+    assert "files incomplete" in out
+    assert "chains incomplete" not in out
+    assert main(["extract-all", str(p), "--out-dir", str(d), "--allow-incomplete"]) == 0
+
+
+def test_extract_all_mixed_summaries(tmp_path, capsys):
+    """AC-14: render loss + copy loss print BOTH summary lines."""
+    fat_base = (63 + FAT_PART_SECTORS) * SECTOR
+    cut = fat_base + (POOL_CLUSTER0 + 1) * CLUSTER + 1000
+    img = bytearray(image_bytes_fat(variant="loop"))
+    p = tmp_path / "mixed.img"
+    p.write_bytes(bytes(img[:cut]))
+    d = tmp_path / "m"
+    assert main(["extract-all", str(p), "--out-dir", str(d)]) == 1
+    out = capsys.readouterr().out
+    assert "chains incomplete" in out
+    assert "files incomplete" in out

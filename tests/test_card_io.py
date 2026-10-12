@@ -329,7 +329,7 @@ def test_cli_devices_flags_a_mounted_dp008ex_volume(capsys, monkeypatch):
     assert main(["devices"]) == 0
     out = capsys.readouterr().out
     assert "MOUNTED VOLUMES on candidate devices" in out
-    assert "labelled like a DP-008EX: the songs are on /dev/mmcblk0" in out
+    assert "labelled like a DP-008EX: songs live on /dev/mmcblk0" in out
 
 
 def test_cli_devices_does_not_claim_cards_for_unrelated_mounts(capsys, monkeypatch):

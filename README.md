@@ -84,11 +84,15 @@ sudo tascam-dp008ex-sd-audio-extractor stems /dev/mmcblk0 --out-dir ~/out
   ```text
   MOUNTED VOLUMES on candidate devices
     /run/media/you/DP-008EX  (vfat, /dev/mmcblk0p1)
-      labelled like a DP-008EX: the songs are on /dev/mmcblk0, not in this mountpoint
+      labelled like a DP-008EX: songs live on /dev/mmcblk0; this mountpoint holds the WAVE/ exports and BACKUP/
   ```
 
-  Do not copy WAVs out of that mountpoint, and do not point the tool at it: the
-  `WAVE/` and `BACKUP/` folders there are exports and backups, not the songs.
+  That mountpoint holds the exports and backups, not the songs — and do not
+  point the tool at it. `extract-all` now reads the FAT32 partition directly
+  from the whole device and copies the `WAVE/*.WAV` master exports (and
+  `BACKUP/` verbatim), so a card whose multitrack projects were deleted
+  still yields its exports; the songs themselves remain outside every
+  partition.
 - **`image` will not overwrite the card it is reading**, will not write to a
   device node, and will not clobber an existing file without `--overwrite`. An
   interrupted image continues with `--resume`.
@@ -113,7 +117,11 @@ flag histogram + master/inode/extent counts.
   mono files — breaking change, see card2 counts below). Pairing signal is
   proven (identical spans); **L/R assignment is conventional, not proven**
   (lowest head A-offset = L) — see `docs/taxonomy.md`. A chain with no
-  partner renders mono plus an `unpaired` skip (strict failure).
+  partner renders mono plus an `unpaired` skip (strict failure). After the
+  render loop, `extract-all` also harvests the FAT32 partition directly
+  from the whole device: `WAVE/*.WAV` master exports are copied verbatim
+  plus `BACKUP/` files opaque, so a card with no multitrack chains left
+  still yields its exports (FAT32 only; copy-don't-decode).
 - **stems** — the second extent family (`0x90000006`/`0x90000005`, raw 512B
   sector addressing) rendered as 44.1kHz mono timelines with each 16,384-sample
   fragment pasted at its boff. Always mono per chain, never interleaved:
@@ -145,6 +153,12 @@ any read was incomplete, and print a one-line summary first:
 2 of 3 chains incomplete (2 skips)
 ```
 
+`extract-all` prints a second line for FAT copies when those skip:
+
+```text
+1 of 2 files incomplete (1 skips)
+```
+
 Pass `--allow-incomplete` to get exit 0 anyway (skips are still reported).
 Every drop, truncate, cap, out-of-range, short-read, odd-byte, omission,
 and unpaired-chain event emits a named, counted `Skip` — there is no
@@ -169,6 +183,13 @@ audit table in its module docstring.
 | CL2 | verify | omission | no size fields, durations unchecked |
 | W1 | write_wav | odd-byte | trailing odd byte dropped (WAV needs whole samples) |
 | A4 | extract-all | unpaired | lone master chain → mono fallback |
+| F1 | FAT copy | short-read | short file read, partial kept (truncated image) |
+| F2 | FAT copy | cap | declared file size over cap (corrupt) |
+| F3 | FAT walk | oob | cluster outside data region (corrupt) |
+| F4 | FAT walk | oob | cluster chain loops (corrupt) |
+| F5 | FAT dir | cap | directory over entry/depth cap (corrupt) |
+| F6 | FAT harvest | omission | non-FAT32 partition or invalid boot sector |
+| F7 | FAT copy | omission | hostile name sanitized, copy proceeds safe |
 | SC3 | slot scan | — | FIXED by the 14-byte chunk overlap (A3) |
 | SC2 | slot scan | — | subsumed: same 400-cap event as SC4, one skip |
 | W2 | pcm_stats mask | — | documented display-sampling (kept: `iter_unpack` raises on odd input) |

@@ -36,6 +36,7 @@ from .extract import (
     read_alloc,
     render_chain,
 )
+from .fat import count_wave_exports, harvest_exports
 from .header import parse_header
 from .imaging import image_device
 from .mbr import extra_partition_warning, mtr_bounds, parse_mbr
@@ -115,6 +116,9 @@ def cmd_devices(probe=True):
                                 f"{len(masters)} master chain(s), "
                                 f"{len(stems)} stem chain(s)"
                             )
+                            k = count_wave_exports(f, mbr)
+                            if k:
+                                contents += f", {k} FAT export(s)"
                 except (OSError, ValueError) as e:
                     contents = f"unreadable ({type(e).__name__})"
             print(f"{node:22} {human(size):>11}  {rem:9}  {contents}")
@@ -124,16 +128,16 @@ def cmd_devices(probe=True):
         for vol in volumes:
             print(f"  {vol['mountpoint']}  ({vol['fstype']}, {vol['partition']})")
             if vol["looks_like_dp008ex"]:
-                # The songs are not on this filesystem, so the mount looks empty.
                 print(
-                    f"    labelled like a DP-008EX: the songs are on {vol['whole']}, "
-                    "not in this mountpoint"
+                    f"    labelled like a DP-008EX: songs live on {vol['whole']}; "
+                    "this mountpoint holds the WAVE/ exports and BACKUP/"
                 )
             else:
                 print(f"    not labelled like a DP-008EX (device: {vol['whole']})")
     if probe:
         print(
-            "\nA DP-008EX card shows master and stem chains. Other media usually show none."
+            "\nA DP-008EX card shows master/stem chains and FAT exports. "
+            "Other media usually show none."
         )
     # Always print the guidance: it matters most when no device was found.
     print("on macOS use the whole disk (/dev/rdiskN), not /dev/diskNs1")
@@ -369,7 +373,7 @@ def cmd_extract_all(img_path, out_dir="out", allow_incomplete=False):
         chains = collect_chains(recs)
         pairs, singles = group_master_chains(chains)
         print(f"chains={len(chains)} pairs={len(pairs)} singles={len(singles)}")
-        skips = []
+        render_skips = []
 
         def _write_mono(ci, ch, res, note=""):
             raw = res.pcm
@@ -379,7 +383,7 @@ def cmd_extract_all(img_path, out_dir="out", allow_incomplete=False):
             name = os.path.join(
                 out_dir, f"chain{ci}_{len(ch)}recs_{dur / 60:.1f}min_rms{rms:.0f}.wav"
             )
-            skips.extend(write_wav(name, raw))
+            render_skips.extend(write_wav(name, raw))
             print(
                 f"chain{ci}: recs={len(ch)} pairs={len(boffs)} boff {boffs[0]:#x}..{boffs[-1]:#x} "
                 f"{len(raw) / 2**20:.1f}MB {dur / 60:.1f}min rms={rms:.0f} peak={peak}{note} -> {name}"
@@ -390,8 +394,8 @@ def cmd_extract_all(img_path, out_dir="out", allow_incomplete=False):
             resr = render_chain(
                 f, base, end, [p for r in chr_ for p in extent_pairs(r)]
             )
-            skips.extend(resl.skips)
-            skips.extend(resr.skips)
+            render_skips.extend(resl.skips)
+            render_skips.extend(resr.skips)
             if len(resl.pcm) == len(resr.pcm):
                 stereo = interleave_stereo(resl.pcm, resr.pcm)
                 rms, peak = pcm_stats(stereo[: 4 * 2**20])
@@ -399,7 +403,7 @@ def cmd_extract_all(img_path, out_dir="out", allow_incomplete=False):
                 name = os.path.join(
                     out_dir, f"stereo_c{ci}c{cj}_{dur / 60:.1f}min_rms{rms:.0f}.wav"
                 )
-                skips.extend(write_wav(name, stereo, nchannels=2))
+                render_skips.extend(write_wav(name, stereo, nchannels=2))
                 print(
                     f"stereo c{ci}+c{cj}: {len(stereo) / 2**20:.1f}MB {dur / 60:.1f}min "
                     f"rms={rms:.0f} peak={peak} L/R conventional -> {name}"
@@ -415,8 +419,8 @@ def cmd_extract_all(img_path, out_dir="out", allow_incomplete=False):
                 _write_mono(cj, chr_, resr, note=" (pair length mismatch)")
         for ci, ch in singles:
             res = render_chain(f, base, end, [p for r in ch for p in extent_pairs(r)])
-            skips.extend(res.skips)
-            skips.append(
+            render_skips.extend(res.skips)
+            render_skips.append(
                 Skip(
                     site="A4",
                     kind=Kind.UNPAIRED,
@@ -427,9 +431,16 @@ def cmd_extract_all(img_path, out_dir="out", allow_incomplete=False):
                 )
             )
             _write_mono(ci, ch, res, note=" (unpaired)")
-        if skips:
-            print(summarize(skips, len(chains), "chains"))
-        return strict_exit(skips, allow_incomplete)
+        copy_skips = []
+        files_copied = harvest_exports(f, mbr, out_dir, copy_skips)
+        if render_skips:
+            print(summarize(render_skips, len(chains), "chains"))
+        if copy_skips:
+            files_failed = len(
+                [s for s in copy_skips if s.site in ("F1", "F2", "F3", "F4", "F7")]
+            )
+            print(summarize(copy_skips, files_copied + files_failed, "files"))
+        return strict_exit(render_skips + copy_skips, allow_incomplete)
 
 
 def cmd_stems(img_path, out_dir="stems_out", allow_incomplete=False):
@@ -683,7 +694,9 @@ def main(argv=None):
     pc.add_argument("--limit", type=int, default=0)
     pc.add_argument("--dump-top", type=int, default=0)
     pc.add_argument("--out-dir", default="carve_out")
-    px = sub.add_parser("extract-all", help="extract extent chains to mono WAVs")
+    px = sub.add_parser(
+        "extract-all", help="render master chains to WAVs and copy FAT32 exports"
+    )
     px.add_argument("image")
     px.add_argument("--out-dir", default="out")
     pt = sub.add_parser(
